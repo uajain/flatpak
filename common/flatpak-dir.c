@@ -3459,6 +3459,7 @@ flatpak_dir_pull (FlatpakDir          *self,
   g_auto(GLnxConsoleRef) console = { 0, };
   g_autoptr(OstreeAsyncProgress) console_progress = NULL;
   g_autoptr(GPtrArray) subdirs_arg = NULL;
+  g_autoptr(GError) my_error = NULL;
 #ifdef FLATPAK_ENABLE_P2P
   g_auto(OstreeRepoFinderResultv) allocated_results = NULL;
 #endif
@@ -3625,8 +3626,20 @@ flatpak_dir_pull (FlatpakDir          *self,
                   subdirs_arg ? (const char **)subdirs_arg->pdata : NULL,
                   ref, rev, results, flatpak_flags, flags,
                   progress,
-                  cancellable, error))
+                  cancellable, &my_error))
     {
+      if (g_error_matches (my_error, G_IO_ERROR, G_FILE_ERROR_NOSPC))
+        {
+	  int dfd;
+	  g_autoptr (GFile) file = NULL;
+
+	  /* Cleanup repo/tmp; currently for --user */
+	  dfd = ostree_repo_get_dfd (repo);
+	  file = g_file_new_for_path (glnx_fdrel_abspath (dfd, "tmp"));
+	  flatpak_rm_rf (file, cancellable, NULL);
+	  g_propagate_error (error, g_steal_pointer (&my_error));
+        }
+
       g_prefix_error (error, _("While pulling %s from remote %s: "), ref, state->remote_name);
       goto out;
     }
@@ -3780,6 +3793,7 @@ flatpak_dir_pull_untrusted_local (FlatpakDir          *self,
   g_autoptr(GVariant) extra_data_sources = NULL;
   g_autoptr(GPtrArray) subdirs_arg = NULL;
   g_auto(GLnxLockFile) lock = { 0, };
+  g_autoptr(GError) my_error = NULL;
   gboolean ret = FALSE;
 
   if (!flatpak_dir_ensure_repo (self, cancellable, error))
@@ -3966,8 +3980,20 @@ flatpak_dir_pull_untrusted_local (FlatpakDir          *self,
   if (!repo_pull_local_untrusted (self, self->repo, remote_name, url,
                                   subdirs_arg ? (const char **)subdirs_arg->pdata : NULL,
                                   ref, checksum, progress,
-                                  cancellable, error))
+                                  cancellable, my_error))
     {
+      if (g_error_matches (my_error, G_IO_ERROR, G_FILE_ERROR_NOSPC))
+        {
+          int dfd;
+          g_autoptr (GFile) file = NULL;
+
+          /* Cleanup repo/tmp; currently for --user */
+          dfd = ostree_repo_get_dfd (repo);
+          file = g_file_new_for_path (glnx_fdrel_abspath (dfd, "tmp"));
+          flatpak_rm_rf (file, cancellable, NULL);
+          g_propagate_error (error, g_steal_pointer (&my_error));
+        }
+
       g_prefix_error (error, _("While pulling %s from remote %s: "), ref, remote_name);
       goto out;
     }
