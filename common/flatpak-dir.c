@@ -3980,7 +3980,7 @@ flatpak_dir_pull_untrusted_local (FlatpakDir          *self,
   if (!repo_pull_local_untrusted (self, self->repo, remote_name, url,
                                   subdirs_arg ? (const char **)subdirs_arg->pdata : NULL,
                                   ref, checksum, progress,
-                                  cancellable, my_error))
+                                  cancellable, &my_error))
     {
       if (g_error_matches (my_error, G_IO_ERROR, G_FILE_ERROR_NOSPC))
         {
@@ -3988,7 +3988,7 @@ flatpak_dir_pull_untrusted_local (FlatpakDir          *self,
           g_autoptr (GFile) file = NULL;
 
           /* Cleanup repo/tmp; currently for --user */
-          dfd = ostree_repo_get_dfd (repo);
+          dfd = ostree_repo_get_dfd (self->repo);
           file = g_file_new_for_path (glnx_fdrel_abspath (dfd, "tmp"));
           flatpak_rm_rf (file, cancellable, NULL);
           g_propagate_error (error, g_steal_pointer (&my_error));
@@ -6510,6 +6510,7 @@ flatpak_dir_install (FlatpakDir          *self,
                      GError             **error)
 {
   FlatpakPullFlags flatpak_flags;
+  g_autoptr(GError) my_error = NULL;
 
   flatpak_flags = FLATPAK_PULL_FLAGS_DOWNLOAD_EXTRA_DATA;
   if (no_static_deltas)
@@ -6643,8 +6644,24 @@ flatpak_dir_install (FlatpakDir          *self,
                                                    (const char * const *) subpaths,
                                                    installation ? installation : "",
                                                    cancellable,
-                                                   error))
-        return FALSE;
+                                                   &my_error))
+        {
+	  if (g_error_matches (my_error, G_IO_ERROR, G_FILE_ERROR_NOSPC))
+	    {
+	      g_autoptr(GFile) cache_dir = NULL;
+	      g_autoptr(GError) cache_dir_error = NULL;
+
+	      cache_dir =  flatpak_ensure_system_user_cache_dir_location (&cache_dir_error);
+	      if (!cache_dir_error)
+                flatpak_rm_rf (cache_dir, cancellable, NULL);
+	      else
+                g_propogate_error (my_error, g_steal_pointer (&cache_dir_error));
+
+	      g_propogate_error (error, g_steal_pointer (&my_error));
+	    }
+	  
+          return FALSE;	
+	}
 
       if (child_repo_path)
         (void) glnx_shutil_rm_rf_at (AT_FDCWD, child_repo_path, NULL, NULL);
