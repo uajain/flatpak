@@ -1177,6 +1177,31 @@ flatpak_dir_system_helper_call_deploy (FlatpakDir         *self,
   return ret != NULL;
 }
 
+/*
+static gboolean
+flatpak_dir_system_helper_call_create_system_child_repo (FlatpakDir    *self,
+                                                         uid_t          uid,
+                                                         const gchar   *optional_commit,
+                                                         const gchar   *arg_installation,
+                                                         const gchar   *out_repo_path,
+                                                         GCancellable  *cancellable,
+                                                         GError       **error)
+{
+  g_autoptr(GVariant) ret =
+    flatpak_dir_system_helper_call (self, "CreateSystemChildRepo",
+                                    g_variant_new ("(uss)",
+                                                   uid,
+                                                   optional_commit,
+                                                   arg_installation),
+                                    cancellable, error);
+  if (ret == NULL)
+    return FALSE;
+
+  g_variant_get (ret, "(s)", out_repo_path);
+  return TRUE;
+}
+*/
+
 static gboolean
 flatpak_dir_system_helper_call_deploy_appstream (FlatpakDir   *self,
                                                  const gchar  *arg_repo_path,

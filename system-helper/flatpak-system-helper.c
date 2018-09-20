@@ -142,6 +142,49 @@ no_progress_cb (OstreeAsyncProgress *progress, gpointer user_data)
 }
 
 static gboolean
+handle_create_system_child_repo (FlatpakSystemHelper   *object,
+                                 GDBusMethodInvocation *invocation,
+                                 uid_t                  uid,
+                                 const gchar           *optional_commit,
+                                 const gchar           *arg_installation)
+{
+  g_autoptr(FlatpakDir) system = NULL;
+  g_autoptr(GError) error = NULL;
+  g_autoptr(OstreeRepo) child_repo = NULL;
+  g_autoptr(GFile) cache_dir = NULL;
+  g_auto(GLnxLockFile) child_repo_lock = { 0, };
+  g_autofree gchar *cache_uid_tmpdir = NULL;
+  g_autofree gchar *basedir = NULL;
+  g_autofree gchar *flatpak_cache_uid_tmpdir = NULL;
+  g_autofree gchar *child_repo_path = NULL;
+
+  system = dir_get_system (arg_installation, &error);
+  if (system == NULL)
+    {
+      g_dbus_method_invocation_return_gerror (invocation, error);
+      return TRUE;
+    }
+
+  cache_uid_tmpdir = g_strdup_printf ("flatpak-cache-%u-XXXXXX", uid);
+  basedir = g_file_get_path (flatpak_dir_get_path (system));
+  flatpak_cache_uid_tmpdir = g_build_filename (basedir, "repo", "tmp", cache_uid_tmpdir, NULL);
+
+  if (g_mkdtemp_full (flatpak_cache_uid_tmpdir, 0755) == NULL)
+    {
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+                                             "Can't create temporary directory: %s", error->message);
+      return TRUE;
+    }
+
+  cache_dir = g_file_new_for_path (flatpak_cache_uid_tmpdir);
+  child_repo = flatpak_dir_create_child_repo (system, cache_dir, &child_repo_lock, optional_commit, &error);
+  child_repo_path = g_file_get_path (ostree_repo_get_path (child_repo));
+
+  flatpak_system_helper_complete_create_system_child_repo (object, invocation, child_repo_path);
+  return TRUE;
+}
+
+static gboolean
 handle_deploy (FlatpakSystemHelper   *object,
                GDBusMethodInvocation *invocation,
                const gchar           *arg_repo_path,
@@ -1250,7 +1293,8 @@ flatpak_authorize_method_handler (GDBusInterfaceSkeleton *interface,
            g_strcmp0 (method_name, "PruneLocalRepo") == 0 ||
            g_strcmp0 (method_name, "EnsureRepo") == 0 ||
            g_strcmp0 (method_name, "RunTriggers") == 0 ||
-           g_strcmp0 (method_name, "UpdateSummary") == 0)
+           g_strcmp0 (method_name, "UpdateSummary") == 0 ||
+           g_strcmp0 (method_name, "CreateSystemChildRepo") == 0)
     {
       const char *remote;
 
@@ -1321,6 +1365,7 @@ on_bus_acquired (GDBusConnection *connection,
   g_signal_connect (helper, "handle-ensure-repo", G_CALLBACK (handle_ensure_repo), NULL);
   g_signal_connect (helper, "handle-run-triggers", G_CALLBACK (handle_run_triggers), NULL);
   g_signal_connect (helper, "handle-update-summary", G_CALLBACK (handle_update_summary), NULL);
+  g_signal_connect (helper, "handle-create-system-child-repo", G_CALLBACK (handle_create_system_child_repo), NULL);
 
   g_signal_connect (helper, "g-authorize-method",
                     G_CALLBACK (flatpak_authorize_method_handler),
