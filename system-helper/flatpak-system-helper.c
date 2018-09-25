@@ -144,10 +144,12 @@ no_progress_cb (OstreeAsyncProgress *progress, gpointer user_data)
 static gboolean
 handle_create_system_child_repo (FlatpakSystemHelper   *object,
                                  GDBusMethodInvocation *invocation,
-                                 uid_t                  uid,
                                  const gchar           *optional_commit,
                                  const gchar           *arg_installation)
 {
+  GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
+  const gchar *sender = g_dbus_method_invocation_get_sender (invocation);
+
   g_autoptr(FlatpakDir) system = NULL;
   g_autoptr(GError) error = NULL;
   g_autoptr(OstreeRepo) child_repo = NULL;
@@ -157,12 +159,48 @@ handle_create_system_child_repo (FlatpakSystemHelper   *object,
   g_autofree gchar *basedir = NULL;
   g_autofree gchar *flatpak_cache_uid_tmpdir = NULL;
   g_autofree gchar *child_repo_path = NULL;
+  g_autoptr(GDBusMessage) msg = NULL;
+  g_autoptr(GDBusMessage) reply = NULL;
+  guint32 uid;
 
   system = dir_get_system (arg_installation, &error);
   if (system == NULL)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
       return TRUE;
+    }
+
+  msg = g_dbus_message_new_method_call ("org.freedesktop.DBus",
+                                        "/org/freedesktop/DBus",
+                                        "org.freedesktop.DBus",
+                                        "GetConnectionCredentials");
+  g_dbus_message_set_body (msg, g_variant_new ("(s)", sender));
+
+  reply = g_dbus_connection_send_message_with_reply_sync (connection, msg,
+                                                          G_DBUS_SEND_MESSAGE_FLAGS_NONE,
+                                                          -1,
+                                                          NULL,
+                                                          NULL,
+                                                          &error);
+  if (reply == NULL)
+    return FALSE;
+
+  if (g_dbus_message_get_message_type (reply) == G_DBUS_MESSAGE_TYPE_METHOD_RETURN)
+    {
+      GVariant *body = g_dbus_message_get_body (reply);
+      g_autoptr(GVariantIter) iter = NULL;
+      const char *key;
+      GVariant *value;
+
+      g_variant_get (body, "(a{sv})", &iter);
+      while (g_variant_iter_loop (iter, "{&sv}", &key, &value))
+        {
+          if (strcmp (key, "UnixUserID") == 0)
+            {
+              uid = g_variant_get_uint32 (value);
+              break;
+            }
+        }
     }
 
   cache_uid_tmpdir = g_strdup_printf ("flatpak-cache-%u-XXXXXX", uid);
