@@ -35,21 +35,85 @@ static PolkitAuthority *authority = NULL;
 static FlatpakSystemHelper *helper = NULL;
 static GMainLoop *main_loop = NULL;
 static guint name_owner_id = 0;
+static GPtrArray *ongoing_pulls = NULL;
 
 static gboolean on_session_bus = FALSE;
 static gboolean no_idle_exit = FALSE;
 
 #define IDLE_TIMEOUT_SECS 10 * 60
+#define MAX_PULLS_PER_USER 16
 
 /* This uses a weird Auto prefix to avoid conflicts with later added polkit types.
  */
 typedef PolkitAuthorizationResult AutoPolkitAuthorizationResult;
 typedef PolkitDetails             AutoPolkitDetails;
 typedef PolkitSubject             AutoPolkitSubject;
+typedef _FlatpakSystemHelperOngoingPull FlatpakSystemHelperOngoingPull;
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (AutoPolkitAuthorizationResult, g_object_unref)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (AutoPolkitDetails, g_object_unref)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (AutoPolkitSubject, g_object_unref)
+
+struct _FlatpakSystemHelperOngoingPull
+{
+  gchar *root_folder_name;
+  gchar *user_folder_name;
+  const gchar *commit_id;
+  const gchar *ref;
+  guint watch_id;
+  uid_t uid;
+
+  GSubProcess bindfs;
+}
+
+static void
+name_vanished_callback (GDBusConnection *connection, const gchar *name, gpointer user_data)
+{
+  FlatpakSystemHelperOngoingPull *pull = (FlatpakSystemHelperOngoingPull *) user_data;
+
+  system_helper_ongoing_pull_free (pull);
+}
+
+static FlatpakSystemHelperOngoingPull *
+system_helper_ongoing_pull_new (GDBusConnection *connection,
+                                uid_t uid,
+                                const gchar *ref,
+                                const gchar *optional_commit,
+                                gchar *user_folder_name)
+{
+  FlatpakSystemHelperOngoingPull *data;
+
+  data = g_slice_new0 (FlatpakSystemHelperOngoingPull);
+  if (optional_commit)
+    data->commit_id = optional_commit;
+  data->uid = uid;
+  data->ref = ref;
+  data->watch_id = g_bus_watch_name_on_connection (connection,
+                                                   g_dbus_connection_get_unique_name (connection),
+						   G_BUS_NAME_WATCHER_FLAGS_NONE,
+						   NULL,
+						   name_vanished_callback,
+						   data,
+						   NULL);
+
+  data->user_folder_name = g_strdup (cache_uid_tmpdir);
+  return data;
+}
+
+static void 
+system_helper_ongoing_pull_free (FlatpakSystemHelperOngoingPull *self)
+{
+  g_free (self->root_folder_name);
+  g_free (self->user_folder_name);
+  if (self->watch_id)
+    g_source_remove(watch_id);
+  /*
+   * if (self->bindfs)
+   * umount self->root_folder;
+   * kill (bindfs)
+   */
+  g_ptr_array_remove (ongoing_pulls, self);
+}
 
 static void
 skeleton_died_cb (gpointer data)
@@ -96,6 +160,7 @@ idle_timeout_cb (gpointer user_data)
       g_debug ("Idle - unowning name");
       unref_skeleton_in_timeout ();
     }
+
   return G_SOURCE_REMOVE;
 }
 
@@ -141,27 +206,30 @@ no_progress_cb (OstreeAsyncProgress *progress, gpointer user_data)
 {
 }
 
+static void
+name_vanished_cb (gpointer user_data)
+{
+  FlatpakSystemHelperOngoingPull *pull = (FlatpakSystemHelperOngoingPull*) data;
+  system_helper_ongoing_pull_free (pull);
+}
+
 static gboolean
 handle_create_system_child_repo (FlatpakSystemHelper   *object,
                                  GDBusMethodInvocation *invocation,
+				 const gchar           *arg_ref,
                                  const gchar           *optional_commit,
                                  const gchar           *arg_installation)
 {
   GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
   const gchar *sender = g_dbus_method_invocation_get_sender (invocation);
-
+  FlatpakSystemHelperOngoingPull *new_uid_pull;
   g_autoptr(FlatpakDir) system = NULL;
   g_autoptr(GError) error = NULL;
-  g_autoptr(OstreeRepo) child_repo = NULL;
-  g_autoptr(GFile) cache_dir = NULL;
-  g_auto(GLnxLockFile) child_repo_lock = { 0, };
   g_autofree gchar *cache_uid_tmpdir = NULL;
-  g_autofree gchar *basedir = NULL;
-  g_autofree gchar *flatpak_cache_uid_tmpdir = NULL;
-  g_autofree gchar *child_repo_path = NULL;
   g_autoptr(GDBusMessage) msg = NULL;
   g_autoptr(GDBusMessage) reply = NULL;
   guint32 uid;
+  guint uid_pull_count = 0;
 
   system = dir_get_system (arg_installation, &error);
   if (system == NULL)
@@ -169,6 +237,9 @@ handle_create_system_child_repo (FlatpakSystemHelper   *object,
       g_dbus_method_invocation_return_gerror (invocation, error);
       return TRUE;
     }
+
+  if (ongoing_pulls == NULL)
+    ongoing_pulls = g_ptr_array_new ();
 
   msg = g_dbus_message_new_method_call ("org.freedesktop.DBus",
                                         "/org/freedesktop/DBus",
@@ -203,22 +274,54 @@ handle_create_system_child_repo (FlatpakSystemHelper   *object,
         }
     }
 
-  cache_uid_tmpdir = g_strdup_printf ("flatpak-cache-%u-XXXXXX", uid);
-  basedir = g_file_get_path (flatpak_dir_get_path (system));
-  flatpak_cache_uid_tmpdir = g_build_filename (basedir, "repo", "tmp", cache_uid_tmpdir, NULL);
+  for (guint i = 0; i < ongoing_pulls->len; i++)
+    {
+      FlatpakSystemHelperOngoingPull *pull_tmp;
+      pull_tmp = g_ptr_array_index (ongoing_pulls, i);
+      if (pull_tmp->uid = uid)
+        {
+          uid_pull_count++;
+          /*
+	   * If there is a already a pull-folder available, return that. This case if for
+	   * partial pulls that might be occured earlier.
+          if (commit_id = struct->commit_id)
+               return struct->folder_name;
+          */
+        }
+    }
 
-  if (g_mkdtemp_full (flatpak_cache_uid_tmpdir, 0755) == NULL)
+  if (uid_pull_count > MAX_PULLS_PER_USER)
     {
       g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
-                                             "Can't create temporary directory: %s", error->message);
+                                             "Maximum number of pulls per user exceeded for UID: %u", uid);
       return TRUE;
     }
 
-  cache_dir = g_file_new_for_path (flatpak_cache_uid_tmpdir);
-  child_repo = flatpak_dir_create_child_repo (system, cache_dir, &child_repo_lock, optional_commit, &error);
-  child_repo_path = g_file_get_path (ostree_repo_get_path (child_repo));
+  cache_uid_tmpdir = g_strdup_printf ("flatpak-cache-%u-%s-XXXXXX", uid, optional_commit); // TODO: Solve for refs: They have "/" in name
+  new_uid_pull = system_helper_ongoing_pull_new (connection, uid, ref, optional_commit, cache_uid_tmpdir);
+  g_ptr_array_add (ongoing_pulls, new_uid_pull);
 
-  flatpak_system_helper_complete_create_system_child_repo (object, invocation, child_repo_path);
+  if (g_program_find_in_path ("bindfs") != NULL)
+    {
+      g_autofree gchar *base_dir = NULL;
+      g_autofree gchar *root_folder_name = NULL;
+
+      //making root folder 
+      base_dir = g_file_get_path (flatpak_dir_get_path (system));
+      root_folder_name = g_mkdtemp_full (g_build_filename (base_dir,"repo", "tmp", "bindfs-folder-XXXXXX", NULL),
+                                         0755);
+      if (root_folder_name == NULL)
+        {
+           g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+                                                  "Can't root directory for bind mount");
+           return TRUE;
+        }
+      //spawn process bindfs and mount root_folder_name as FuseFS 
+      //new_uid_pull->bindfs = process_handle;
+      new_uid_pull->root_folder_name = g_strdup (root_folder_name);
+     }
+
+  flatpak_system_helper_complete_create_system_child_repo (object, invocation, cache_uid_tmpdir);
   return TRUE;
 }
 
@@ -1383,6 +1486,7 @@ on_bus_acquired (GDBusConnection *connection,
   g_debug ("Bus acquired, creating skeleton");
 
   helper = flatpak_system_helper_skeleton_new ();
+
 
   flatpak_system_helper_set_version (FLATPAK_SYSTEM_HELPER (helper), 1);
 
