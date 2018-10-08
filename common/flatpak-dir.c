@@ -1165,6 +1165,29 @@ flatpak_dir_system_helper_call (FlatpakDir   *self,
 }
 
 static gboolean
+flatpak_dir_system_helper_call_create_system_child_repo (FlatpakDir    *self,
+                                                         const gchar   *ref,
+                                                         const gchar   *optional_commit,
+                                                         const gchar   *arg_installation,
+                                                         gchar   **repo_path,
+                                                         GCancellable  *cancellable,
+                                                         GError       **error)
+{
+  g_autoptr(GVariant) ret =
+    flatpak_dir_system_helper_call (self, "CreatePullCacheDir",
+                                    g_variant_new ("(sss)",
+                                                   ref,
+                                                   optional_commit,
+                                                   arg_installation),
+                                    cancellable, error);
+  if (ret == NULL)
+    return FALSE;
+
+  g_variant_get (ret, "(s)", repo_path);
+  return TRUE;
+}
+
+static gboolean
 flatpak_dir_system_helper_call_deploy (FlatpakDir         *self,
                                        const gchar        *arg_repo_path,
                                        guint               arg_flags,
@@ -7594,30 +7617,45 @@ flatpak_dir_install (FlatpakDir          *self,
         }
       else
         {
+          g_autofree gchar *bindfs_repo_path = NULL;
+          g_autoptr(GFile) bindfs_repo_file = NULL;
+          g_auto(GLnxLockFile) bindfs_repo_lock = { 0, };
+          g_autoptr(OstreeRepo) bindfs_repo = NULL;
+
+          flatpak_dir_system_helper_call_create_system_child_repo (self, ref, opt_commit,
+                                                                   installation ? installation : "",
+                                                                   &bindfs_repo_path, cancellable, error);
+
           /* We're pulling from a remote source, we do the network mirroring pull as a
              user and hand back the resulting data to the system-helper, that trusts us
              due to the GPG signatures in the repo */
 
-          child_repo = flatpak_dir_create_system_child_repo (self, &child_repo_lock, NULL, error);
-          if (child_repo == NULL)
-            return FALSE;
+          bindfs_repo_file = g_file_new_for_path (bindfs_repo_path);
+          bindfs_repo = flatpak_dir_create_child_repo (self, bindfs_repo_file, &bindfs_repo_lock, NULL, error);
+          if (bindfs_repo == NULL)
+            {
+              g_warning ("Cannot create child repo on given path");
+              return FALSE;
+            }
 
           flatpak_flags |= FLATPAK_PULL_FLAGS_SIDELOAD_EXTRA_DATA;
 
           /* Don’t resolve a rev or OstreeRepoFinderResult set early; the pull
            * code will do this. */
           if (!flatpak_dir_pull (self, state, ref, opt_commit, NULL, subpaths,
-                                 child_repo,
+                                 bindfs_repo,
                                  flatpak_flags,
                                  OSTREE_REPO_PULL_FLAGS_MIRROR,
                                  progress, cancellable, error))
             return FALSE;
 
-          if (!child_repo_ensure_summary (child_repo, state, cancellable, error))
+          if (!child_repo_ensure_summary (bindfs_repo, state, cancellable, error))
             return FALSE;
 
-          child_repo_path = g_file_get_path (ostree_repo_get_path (child_repo));
+          child_repo_path = g_file_get_path (ostree_repo_get_path (bindfs_repo));
         }
+
+      g_assert (child_repo_path != NULL);
 
       if (no_deploy)
         helper_flags |= FLATPAK_HELPER_DEPLOY_FLAGS_NO_DEPLOY;
