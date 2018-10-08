@@ -25,31 +25,128 @@
 #include <string.h>
 #include <gio/gio.h>
 #include <polkit/polkit.h>
+#include <sys/mount.h>
+#include <gio/gunixmounts.h>
 
 #include "flatpak-dbus-generated.h"
 #include "flatpak-dir-private.h"
 #include "flatpak-oci-registry-private.h"
 #include "flatpak-error.h"
+#include "flatpak-utils-private.h"
 
 static PolkitAuthority *authority = NULL;
 static FlatpakSystemHelper *helper = NULL;
 static GMainLoop *main_loop = NULL;
 static guint name_owner_id = 0;
+static GPtrArray *ongoing_pulls = NULL;
 
 static gboolean on_session_bus = FALSE;
 static gboolean no_idle_exit = FALSE;
 
 #define IDLE_TIMEOUT_SECS 10 * 60
+#define MAX_PULLS_PER_USER 16
 
 /* This uses a weird Auto prefix to avoid conflicts with later added polkit types.
  */
 typedef PolkitAuthorizationResult AutoPolkitAuthorizationResult;
 typedef PolkitDetails             AutoPolkitDetails;
 typedef PolkitSubject             AutoPolkitSubject;
+typedef struct _FlatpakSystemHelperOngoingPull FlatpakSystemHelperOngoingPull;
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (AutoPolkitAuthorizationResult, g_object_unref)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (AutoPolkitDetails, g_object_unref)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (AutoPolkitSubject, g_object_unref)
+
+struct _FlatpakSystemHelperOngoingPull
+{
+  FlatpakSystemHelper *object;
+  GDBusMethodInvocation *invocation;
+
+  const gchar *commit_id;
+  const gchar *ref;
+  guint watch_id;
+  uid_t uid;
+  guint64 current_timestamp;
+
+  gchar *root_folder_name;
+  gchar *user_folder_name;
+
+  GUnixMountMonitor *mount_monitor;
+  gulong mount_monitor_id;
+
+  GSubprocess *bindfs;
+};
+
+static void
+system_helper_ongoing_pull_free (FlatpakSystemHelperOngoingPull *pull)
+{
+  g_autoptr(GFile) root_folder = g_file_new_for_path (pull->root_folder_name);
+  g_autoptr(GFile) user_folder = g_file_new_for_path (pull->user_folder_name);
+
+  flatpak_rm_rf (root_folder, NULL, NULL);
+  flatpak_rm_rf (user_folder, NULL, NULL);
+
+  g_free (pull->root_folder_name);
+  g_free (pull->user_folder_name);
+  if (pull->watch_id)
+    g_source_remove(pull->watch_id);
+
+  if (pull->bindfs)
+    {
+      umount (pull->user_folder_name);
+      g_subprocess_force_exit (pull->bindfs);
+      g_clear_object (&pull->bindfs);
+    }
+
+  if (pull->mount_monitor_id)
+    {
+      g_signal_handler_disconnect (pull->mount_monitor, pull->mount_monitor_id);
+      pull->mount_monitor_id = 0;
+    }
+
+  g_object_unref (pull->mount_monitor);
+
+  g_ptr_array_remove (ongoing_pulls, pull);
+  g_ptr_array_unref (ongoing_pulls);
+
+  if (ongoing_pulls->len == 0)
+    ongoing_pulls = NULL;
+}
+
+static void
+name_vanished_callback (GDBusConnection *connection, const gchar *name, gpointer user_data)
+{
+  FlatpakSystemHelperOngoingPull *pull = (FlatpakSystemHelperOngoingPull *) user_data;
+  system_helper_ongoing_pull_free (pull);
+}
+
+static FlatpakSystemHelperOngoingPull *
+system_helper_ongoing_pull_new (FlatpakSystemHelper *object,
+                                GDBusMethodInvocation *invocation,
+                                uid_t            uid,
+                                const gchar     *ref,
+                                const gchar     *optional_commit,
+                                gchar           *user_folder_name)
+{
+  GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
+  FlatpakSystemHelperOngoingPull *pull;
+
+  pull = g_slice_new0 (FlatpakSystemHelperOngoingPull);
+  pull->object = object;
+  pull->invocation = invocation;
+
+  if (optional_commit)
+    pull->commit_id = optional_commit;
+  pull->uid = uid;
+  pull->ref = ref;
+  pull->watch_id = g_bus_watch_name_on_connection (connection,
+                                                   g_dbus_connection_get_unique_name (connection),
+                                                   G_BUS_NAME_WATCHER_FLAGS_NONE,
+                                                   NULL, name_vanished_callback, pull, NULL);
+
+  pull->user_folder_name = g_strdup (user_folder_name);
+  return pull;
+}
 
 static void
 skeleton_died_cb (gpointer data)
@@ -141,6 +238,169 @@ no_progress_cb (OstreeAsyncProgress *progress, gpointer user_data)
 {
 }
 
+static uid_t
+get_connection_uid (GDBusMethodInvocation *invocation, GError **error)
+{
+  GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
+  const gchar *sender = g_dbus_method_invocation_get_sender (invocation);
+  g_autoptr(GVariant) credentials = NULL;
+  g_autoptr(GVariantIter) iter = NULL;
+  const char *key = NULL;
+  g_autoptr(GVariant) value = NULL;
+  uid_t uid;
+
+  credentials = g_dbus_connection_call_sync (connection,
+                                             "org.freedesktop.DBus",
+                                             "/org/freedesktop/DBus",
+                                             "org.freedesktop.DBus",
+                                             "GetConnectionCredentials",
+                                             g_variant_new ("(s)", sender),
+                                             NULL, G_DBUS_CALL_FLAGS_NONE, G_MAXINT, NULL, error);
+
+  if (credentials == NULL)
+    {
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+                                             "Error calling GetConnectionCredentials over D-Bus");
+      return TRUE;
+    }
+
+  g_variant_get (credentials, "(a{sv})", &iter);
+  while (g_variant_iter_loop (iter, "{&sv}", &key, &value))
+    {
+      if (strcmp (key, "UnixUserID") == 0)
+        {
+          uid = g_variant_get_uint32 (value);
+          break;
+        }
+    }
+  return uid;
+}
+
+static void
+mounts_changed (GUnixMountMonitor *monitor, gpointer user_data)
+{
+  FlatpakSystemHelperOngoingPull *pull = (FlatpakSystemHelperOngoingPull *) user_data;
+  g_autoptr(GList) mounts = NULL;
+  GList *l = NULL;
+  mounts = g_unix_mounts_get (&pull->current_timestamp);
+  for (l = g_list_reverse (mounts); l != NULL; l = l->next)
+    {
+      if (g_strcmp0 (pull->user_folder_name, g_unix_mount_get_mount_path (l->data)) == 0)
+        {
+          flatpak_system_helper_complete_create_pull_cache_dir (pull->object,
+                                                                pull->invocation,
+                                                                pull->user_folder_name);
+	  break;
+        }
+    }
+  // TODO: Way to return error if mount isn't successful
+}
+
+static gboolean
+handle_create_pull_cache_dir (FlatpakSystemHelper   *object,
+                              GDBusMethodInvocation *invocation,
+                              const gchar           *arg_ref,
+                              const gchar           *optional_commit,
+                              const gchar           *arg_installation)
+{
+  GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
+  const gchar *sender = g_dbus_method_invocation_get_sender (invocation);
+  FlatpakSystemHelperOngoingPull *new_pull;
+  g_autoptr(FlatpakDir) system = NULL;
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *user_folder = NULL;
+  g_autofree gchar *root_folder = NULL;
+  g_autofree gchar *flatpak_dir = NULL;
+  g_autofree gchar *bindfs_path = NULL;
+  guint uid_pull_count = 0;
+  uid_t uid;
+
+  system = dir_get_system (arg_installation, &error);
+  if (system == NULL)
+    {
+      g_dbus_method_invocation_return_gerror (invocation, error);
+      return TRUE;
+    }
+
+  if (ongoing_pulls == NULL)
+    ongoing_pulls = g_ptr_array_new ();
+
+  for (guint i = 0; i < ongoing_pulls->len; i++)
+    {
+      FlatpakSystemHelperOngoingPull *pull_tmp;
+
+      pull_tmp = g_ptr_array_index (ongoing_pulls, i);
+      if (pull_tmp->uid == uid)
+        {
+          uid_pull_count++;
+          // TODO: If there is a already a partial pull available, return that.
+        }
+    }
+
+  uid = get_connection_uid (invocation, &error);
+  if (uid_pull_count > MAX_PULLS_PER_USER)
+    {
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+                                             "Maximum number of pulls per user exceeded for UID: %u", uid);
+      return TRUE;
+    }
+
+  flatpak_dir = g_file_get_path (flatpak_dir_get_path (system));
+  root_folder = g_mkdtemp_full (g_build_filename (flatpak_dir, "repo", "tmp", "flatpak-cache-XXXXXX", NULL), 0755);
+
+  user_folder = g_strdup_printf ("%s-bindfs", root_folder);
+
+  if (g_mkdir_with_parents (user_folder, 0755) == -1)
+    {
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+                                             "Cannot create directory for bindfs mount at: %s", user_folder);
+      return TRUE;
+    }
+
+  new_pull = system_helper_ongoing_pull_new (object, invocation, uid, arg_ref, optional_commit, user_folder);
+  g_ptr_array_add (ongoing_pulls, new_pull);
+
+  bindfs_path = g_find_program_in_path ("bindfs");
+  if (bindfs_path != NULL)
+    {
+      g_autofree gchar *arg_user = NULL;
+      g_autoptr(GFile) user_folder_file = NULL;
+      g_autoptr(GFileMonitor) user_folder_mount_monitor = NULL;
+
+      new_pull->mount_monitor = g_unix_mount_monitor_get ();
+      new_pull->current_timestamp = g_get_monotonic_time();
+      new_pull->mount_monitor_id = g_signal_connect (new_pull->mount_monitor,
+                                                     "mounts-changed",
+                                                     G_CALLBACK (mounts_changed),
+                                                     new_pull);
+
+      user_folder_file = g_file_new_for_path (user_folder);
+      user_folder_mount_monitor = g_file_monitor_file (user_folder_file, G_FILE_MONITOR_NONE, NULL, NULL);
+
+      if (user_folder_mount_monitor == NULL)
+	      g_warning ("Couldn't set monitoring on user folder\n");
+
+      arg_user = g_strdup_printf ("--force-user=%"G_GUINT32_FORMAT, uid);
+      new_pull->bindfs = g_subprocess_new (G_SUBPROCESS_FLAGS_NONE,
+                                           NULL,
+                                           bindfs_path,
+                                           arg_user,"-f",
+                                           "--create-for-user=root",
+                                           "--create-for-group=root",
+                                           root_folder, user_folder, NULL);
+
+      new_pull->root_folder_name = g_strdup (root_folder);
+    }
+  else
+    {
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+                                             "Can't find bindfs in the system.");
+      return TRUE;
+    }
+
+  return TRUE;
+}
+
 static gboolean
 handle_deploy (FlatpakSystemHelper   *object,
                GDBusMethodInvocation *invocation,
@@ -162,6 +422,9 @@ handle_deploy (FlatpakSystemHelper   *object,
   gboolean local_pull;
   gboolean reinstall;
   g_autofree char *url = NULL;
+  g_autofree gchar *user_folder = NULL;
+  uid_t uid;
+  FlatpakSystemHelperOngoingPull *ongoing_pull = NULL;
 
   g_debug ("Deploy %s %u %s %s %s", arg_repo_path, arg_flags, arg_ref, arg_origin, arg_installation);
 
@@ -171,6 +434,46 @@ handle_deploy (FlatpakSystemHelper   *object,
       g_dbus_method_invocation_return_gerror (invocation, error);
       return TRUE;
     }
+
+  user_folder = g_file_get_path (g_file_get_parent (path));
+  uid = get_connection_uid (invocation, &error);
+  for (guint i = 0; i < ongoing_pulls->len; i++)
+    {
+      FlatpakSystemHelperOngoingPull *pull_tmp;
+
+      pull_tmp = g_ptr_array_index (ongoing_pulls, i);
+      if (g_strcmp0(pull_tmp->user_folder_name, user_folder) == 0)
+        {
+          ongoing_pull = pull_tmp;
+
+          g_signal_handler_disconnect (ongoing_pull->mount_monitor, ongoing_pull->mount_monitor_id);
+          ongoing_pull->mount_monitor_id = 0;
+
+          if (umount (user_folder) == -1)
+            {
+              int errsv = errno;
+              g_set_error (&error, G_IO_ERROR, g_io_error_from_errno (errsv),
+                           "Unmounting :%s failed: %s\n", user_folder, g_strerror (errsv));
+              g_dbus_method_invocation_return_gerror (invocation, error);
+              return TRUE;
+            }
+
+          if (ongoing_pull->bindfs)
+            {
+              g_subprocess_wait (ongoing_pull->bindfs, NULL, NULL);
+              g_subprocess_force_exit (ongoing_pull->bindfs);
+            }
+
+          g_autofree gchar *new_path = g_build_filename (ongoing_pull->root_folder_name, g_file_get_basename (path), NULL);
+          g_clear_object(&path);
+          path = g_file_new_for_path (new_path);
+          arg_repo_path = g_steal_pointer (&new_path);
+          break;
+        }
+    }
+
+  if (path == NULL)
+    path = g_file_new_for_path (arg_repo_path);
 
   if ((arg_flags & ~FLATPAK_HELPER_DEPLOY_FLAGS_ALL) != 0)
     {
@@ -447,6 +750,11 @@ handle_deploy (FlatpakSystemHelper   *object,
               return TRUE;
             }
         }
+    }
+
+  if (ongoing_pull)
+    {
+      system_helper_ongoing_pull_free (ongoing_pull);
     }
 
   flatpak_system_helper_complete_deploy (object, invocation);
@@ -1245,7 +1553,8 @@ flatpak_authorize_method_handler (GDBusInterfaceSkeleton *interface,
            g_strcmp0 (method_name, "PruneLocalRepo") == 0 ||
            g_strcmp0 (method_name, "EnsureRepo") == 0 ||
            g_strcmp0 (method_name, "RunTriggers") == 0 ||
-           g_strcmp0 (method_name, "UpdateSummary") == 0)
+           g_strcmp0 (method_name, "UpdateSummary") == 0 ||
+           g_strcmp0 (method_name, "CreatePullCacheDir") == 0)
     {
       const char *remote;
 
@@ -1316,6 +1625,7 @@ on_bus_acquired (GDBusConnection *connection,
   g_signal_connect (helper, "handle-ensure-repo", G_CALLBACK (handle_ensure_repo), NULL);
   g_signal_connect (helper, "handle-run-triggers", G_CALLBACK (handle_run_triggers), NULL);
   g_signal_connect (helper, "handle-update-summary", G_CALLBACK (handle_update_summary), NULL);
+  g_signal_connect (helper, "handle-create-pull-cache-dir", G_CALLBACK (handle_create_pull_cache_dir), NULL);
 
   g_signal_connect (helper, "g-authorize-method",
                     G_CALLBACK (flatpak_authorize_method_handler),
