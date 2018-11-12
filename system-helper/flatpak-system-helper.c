@@ -1505,6 +1505,31 @@ handle_update_summary (FlatpakSystemHelper   *object,
 }
 
 static gboolean
+handle_cancel_pull (FlatpakSystemHelper   *object,
+                    GDBusMethodInvocation *invocation,
+                    const gchar           *arg_installation,
+                    const gchar           *arg_repo_path)
+{
+  g_autoptr(FlatpakSystemHelperOngoingPull) ongoing_pull = NULL;
+  g_autoptr(FlatpakDir) system = NULL;
+  g_autoptr(GError) error = NULL;
+
+  g_debug ("CancelPull %s", arg_installation);
+
+  system = dir_get_system (arg_installation, &error);
+  if (system == NULL)
+    {
+      g_dbus_method_invocation_return_gerror (invocation, error);
+      return TRUE;
+    }
+
+  ongoing_pull = get_ongoing_pull_by_dir (arg_repo_path);
+  flatpak_system_helper_complete_cancel_pull (object, invocation);
+
+  return TRUE;
+}
+
+static gboolean
 flatpak_authorize_method_handler (GDBusInterfaceSkeleton *interface,
                                   GDBusMethodInvocation  *invocation,
                                   gpointer                user_data)
@@ -1633,7 +1658,8 @@ flatpak_authorize_method_handler (GDBusInterfaceSkeleton *interface,
            g_strcmp0 (method_name, "EnsureRepo") == 0 ||
            g_strcmp0 (method_name, "RunTriggers") == 0 ||
            g_strcmp0 (method_name, "UpdateSummary") == 0 ||
-           g_strcmp0 (method_name, "CreatePullCacheDir") == 0)
+           g_strcmp0 (method_name, "CreatePullCacheDir") == 0 ||
+           g_strcmp0 (method_name, "CancelPull") == 0)
     {
       const char *remote;
 
@@ -1705,6 +1731,7 @@ on_bus_acquired (GDBusConnection *connection,
   g_signal_connect (helper, "handle-run-triggers", G_CALLBACK (handle_run_triggers), NULL);
   g_signal_connect (helper, "handle-update-summary", G_CALLBACK (handle_update_summary), NULL);
   g_signal_connect (helper, "handle-create-pull-cache-dir", G_CALLBACK (handle_create_pull_cache_dir), NULL);
+  g_signal_connect (helper, "handle-cancel-pull", G_CALLBACK (handle_cancel_pull), NULL);
 
   g_signal_connect (helper, "g-authorize-method",
                     G_CALLBACK (flatpak_authorize_method_handler),
