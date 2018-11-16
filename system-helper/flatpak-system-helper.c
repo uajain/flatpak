@@ -65,6 +65,9 @@ typedef struct
   GDBusMethodInvocation *invocation;
   GCancellable *cancellable;
 
+  const gchar *ref;
+  const gchar *commit;
+
   guint watch_id;
   uid_t uid;
 
@@ -186,6 +189,8 @@ unsuccessful_mount_timeout (gpointer user_data)
 static FlatpakSystemHelperOngoingPull *
 system_helper_ongoing_pull_new (FlatpakSystemHelper   *object,
                                 GDBusMethodInvocation *invocation,
+                                const gchar           *ref,
+                                const gchar           *commit,
                                 uid_t                  uid,
                                 gchar                 *user_dir_name)
 {
@@ -195,6 +200,8 @@ system_helper_ongoing_pull_new (FlatpakSystemHelper   *object,
   pull = g_slice_new0 (FlatpakSystemHelperOngoingPull);
   pull->object = object;
   pull->invocation = invocation;
+  pull->ref = ref;
+  pull->commit = commit;
   pull->cancellable = g_cancellable_new ();
   pull->uid = uid;
   pull->watch_id = g_bus_watch_name_on_connection (connection,
@@ -381,8 +388,94 @@ subprocess_wait_check_cb (GObject      *source_object,
 }
 
 static gboolean
+check_for_repo_containing_partial_pull (GFile *cache_dir, const gchar *commit)
+{
+  g_autoptr (GFileEnumerator) enumerator = NULL;
+  GFileInfo *file_info = NULL;
+  enumerator = g_file_enumerate_children (cache_dir, G_FILE_ATTRIBUTE_STANDARD_NAME, G_FILE_QUERY_INFO_NONE, NULL, NULL);
+  const gchar *name;
+
+  while (TRUE)
+    {
+      if (!g_file_enumerator_iterate (enumerator, &file_info, NULL, NULL, NULL))
+        return FALSE;
+
+      if (file_info == NULL)
+        return FALSE;
+
+      name = g_file_info_get_name (file_info);
+      if (g_file_info_get_file_type (file_info) == G_FILE_TYPE_DIRECTORY &&
+          g_str_has_prefix (name, "repo-"))
+        {
+          g_autoptr(GFile) repo_file = g_file_get_child (cache_dir, name);
+          g_autoptr(GFile) state = g_file_get_child (repo_file, "state");
+          g_autofree gchar *commit_partial_basename = g_strdup_printf ("%s.commitpartial", commit);
+          g_autoptr(GFile) commit_partial = g_file_get_child (state, commit_partial_basename);
+
+          if (g_file_query_exists (commit_partial, NULL))
+            {
+              g_autoptr(OstreeRepo) repo = ostree_repo_new (repo_file);
+              /* Validate repo before returning */
+              g_print ("There is a partial repo available\n");
+              return ostree_repo_open (repo, NULL, NULL);
+            }
+        }
+    }
+
+  return FALSE;
+}
+
+static gboolean
+check_partial_pull_availability (const gchar *repo_tmp,
+                                 const gchar *ref_basename,
+                                 const gchar *commit,
+                                 gchar      **out_location)
+{
+  g_autoptr (GFileEnumerator) enumerator = NULL;
+  GFileInfo *file_info = NULL;
+  g_autoptr (GFile) repo_tmpfile = g_file_new_for_path (repo_tmp);
+  enumerator = g_file_enumerate_children (repo_tmpfile, G_FILE_ATTRIBUTE_STANDARD_NAME, G_FILE_QUERY_INFO_NONE, NULL, NULL);
+  g_autofree gchar *prefix = NULL;
+  const gchar *name;
+  g_autoptr(GError) error = NULL;
+
+  g_debug ("Checking for partial pull availability");
+  prefix =g_strdup_printf ("flatpak-cache-%s", ref_basename);
+
+  /* We are looking for flatpak-cache-(ref)-XXXXX directory in repo/tmp.
+     If we find one, we try to look for an OSTree repo which possibly
+     the (commit).commitpartial file denoting the partial pull. */
+  while (TRUE)
+    {
+      if (!g_file_enumerator_iterate (enumerator, &file_info, NULL, NULL, &error))
+        {
+          g_debug ("Failed to find partial pull: %s", error->message);
+          break;
+        }
+
+      if (file_info == NULL)
+        break;
+
+      name = g_file_info_get_name (file_info);
+      if (g_file_info_get_file_type (file_info) == G_FILE_TYPE_DIRECTORY &&
+          g_str_has_prefix (name, prefix))
+        {
+          g_autoptr(GFile) cache_dir = g_file_get_child (repo_tmpfile, name);
+          if (check_for_repo_containing_partial_pull (cache_dir, commit))
+            {
+              *out_location = g_file_get_path (cache_dir);
+              return TRUE;
+            }
+        }
+    }
+  return FALSE;
+}
+
+static gboolean
 handle_create_pull_cache_dir (FlatpakSystemHelper   *object,
                               GDBusMethodInvocation *invocation,
+                              const gchar           *ref,
+                              const gchar           *commit,
                               const gchar           *arg_installation)
 {
   GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
@@ -412,6 +505,7 @@ handle_create_pull_cache_dir (FlatpakSystemHelper   *object,
       g_autofree gchar *root_dir = NULL;
       g_autofree gchar *flatpak_dir = NULL;
       g_autofree gchar *arg_user = NULL;
+      g_autofree gchar *out_location = NULL;
       guint uid_pull_count = 0;
       uid_t uid;
 
@@ -432,7 +526,14 @@ handle_create_pull_cache_dir (FlatpakSystemHelper   *object,
       // TODO: If there is a already partial pull available, return that.
 
       flatpak_dir = g_file_get_path (flatpak_dir_get_path (system));
-      root_dir = g_mkdtemp_full (g_build_filename (flatpak_dir, "repo", "tmp", "flatpak-cache-XXXXXX", NULL), 0755);
+      g_autofree gchar *repo_tmp = g_build_filename (flatpak_dir, "repo", "tmp", NULL);
+
+      g_auto(GStrv) parts = flatpak_decompose_ref (ref, NULL);
+      gboolean is_partial_pull = check_partial_pull_availability (repo_tmp, parts[1], commit, &out_location);
+      g_print ("is_partial_pull:%d\nout_location: %s\n", is_partial_pull, out_location);
+
+      g_autofree gchar *cache_dir_basename = g_strdup_printf ("flatpak-cache-%s-XXXXXX", parts[1]);
+      root_dir = g_mkdtemp_full (g_build_filename (repo_tmp, cache_dir_basename, NULL), 0755);
       user_dir = g_strdup_printf ("%s-bindfs", root_dir);
       if (g_mkdir_with_parents (user_dir, 0755) == -1)
         {
@@ -441,7 +542,7 @@ handle_create_pull_cache_dir (FlatpakSystemHelper   *object,
           return TRUE;
         }
 
-      pull_tmp = system_helper_ongoing_pull_new (object, invocation, uid, user_dir);
+      pull_tmp = system_helper_ongoing_pull_new (object, invocation, ref, commit, uid, user_dir);
 
       arg_user = g_strdup_printf ("--force-user=%"G_GUINT32_FORMAT, uid);
       pull_tmp->bindfs = g_subprocess_new (G_SUBPROCESS_FLAGS_NONE,

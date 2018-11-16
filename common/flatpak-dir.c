@@ -1184,6 +1184,8 @@ flatpak_dir_system_helper_call_cancel_pull (FlatpakDir    *self,
 
 static gboolean
 flatpak_dir_system_helper_call_create_pull_cache_dir (FlatpakDir    *self,
+                                                      const gchar   *ref,
+                                                      const gchar   *commit,
                                                       const gchar   *arg_installation,
                                                       gchar        **repo_path,
                                                       GCancellable  *cancellable,
@@ -1191,7 +1193,7 @@ flatpak_dir_system_helper_call_create_pull_cache_dir (FlatpakDir    *self,
 {
   g_autoptr(GVariant) ret =
     flatpak_dir_system_helper_call (self, "CreatePullCacheDir",
-                                    g_variant_new ("(s)", arg_installation),
+                                    g_variant_new ("(sss)", ref, commit, arg_installation),
                                     cancellable, error);
 
   if (ret == NULL)
@@ -7863,7 +7865,7 @@ flatpak_dir_install (FlatpakDir          *self,
           g_autoptr(GError) local_error = NULL;
           gboolean fallback = FALSE;
 
-          if (!flatpak_dir_system_helper_call_create_pull_cache_dir (self,
+          if (!flatpak_dir_system_helper_call_create_pull_cache_dir (self, ref, opt_commit,
                                                                      installation ? installation : "",
                                                                      &repo_tmp_cache_dir, cancellable, &local_error))
             {
@@ -7878,6 +7880,7 @@ flatpak_dir_install (FlatpakDir          *self,
               g_autoptr(GFile) repo_tmp_cache_dir_gfile = NULL;
 
               repo_tmp_cache_dir_gfile = g_file_new_for_path (repo_tmp_cache_dir);
+              // check for a repo using flatpak_fallocate_tmpdir
               child_repo = flatpak_dir_create_child_repo (self, repo_tmp_cache_dir_gfile, &child_repo_lock, NULL, &local_error);
               if (child_repo == NULL)
                 {
@@ -7906,6 +7909,8 @@ flatpak_dir_install (FlatpakDir          *self,
 
           /* Don’t resolve a rev or OstreeRepoFinderResult set early; the pull
            * code will do this. */
+	  g_auto(GStrv)ref_decomposed = flatpak_decompose_ref (ref, NULL);
+	  g_print ("app name : %s\n", ref_decomposed[1]);
           if (!flatpak_dir_pull (self, state, ref, opt_commit, NULL, subpaths, child_repo,
                                  flatpak_flags, OSTREE_REPO_PULL_FLAGS_MIRROR,
                                  progress, cancellable, error)

@@ -145,6 +145,8 @@
     </method>
 
     <method name="CreatePullCacheDir">
+      <arg type='s' name='ref' direction='in'/>
+      <arg type='s' name='commit' direction='in'/>
       <arg type='s' name='installation' direction='in'/>
       <arg type='s' name='repo_path' direction='out'/>
     </method>
