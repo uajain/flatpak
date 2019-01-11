@@ -1215,6 +1215,65 @@ flatpak_dir_system_helper_call (FlatpakDir   *self,
 }
 
 static gboolean
+flatpak_dir_system_helper_call_passfd (FlatpakDir         *self,
+                                       guint               arg_flags,
+                                       const gchar        *arg_installation,
+                                       GCancellable       *cancellable,
+                                       GError            **error)
+
+{
+  g_autoptr(GVariant) ret = NULL;
+  GUnixFDList *out_fd_list = NULL;
+  gint fd_index = -1;
+  gint32 fd = -1;
+
+  if (g_once_init_enter (&self->system_helper_bus))
+    {
+      const char *on_session = g_getenv ("FLATPAK_SYSTEM_HELPER_ON_SESSION");
+      GDBusConnection *system_helper_bus =
+        g_bus_get_sync (on_session != NULL ? G_BUS_TYPE_SESSION : G_BUS_TYPE_SYSTEM,
+                        cancellable, NULL);
+
+      /* To ensure reverse mapping */
+      flatpak_error_quark ();
+
+      g_once_init_leave (&self->system_helper_bus, system_helper_bus ? system_helper_bus : (gpointer) 1 );
+    }
+
+  if (self->system_helper_bus == (gpointer) 1)
+    {
+      flatpak_fail (error, _("Unable to connect to system bus"));
+      return FALSE;
+    } 
+
+  ret = g_dbus_connection_call_with_unix_fd_list_sync (self->system_helper_bus,
+                                                       "org.freedesktop.Flatpak.SystemHelper",
+                                                       "/org/freedesktop/Flatpak/SystemHelper",
+                                                       "org.freedesktop.Flatpak.SystemHelper",
+                                                       "passfd",
+                                                       g_variant_new ("(us)", arg_flags, arg_installation),
+                                                       G_VARIANT_TYPE ("(h)"),
+                                                       G_DBUS_CALL_FLAGS_NONE,
+                                                      -1,                      /* default timeout */
+                                                       NULL,                   /* fd_list */
+                                                       &out_fd_list,           /* out_fd_list */
+                                                       NULL,                   /* GCancellable */
+                                                       error);
+
+  if (ret == NULL)
+    { 
+      g_warning ("DBUS Failed : %s\n", (*error)->message);
+      return FALSE;
+    }
+
+  g_variant_get (ret, "(h)", &fd_index);
+  fd  = g_unix_fd_list_get (out_fd_list, fd_index, NULL);
+  g_print ("Got Fd as %d\n", fd);
+
+  return ret != NULL;
+}
+
+static gboolean
 flatpak_dir_system_helper_call_deploy (FlatpakDir         *self,
                                        const gchar        *arg_repo_path,
                                        guint               arg_flags,
@@ -7874,6 +7933,7 @@ flatpak_dir_install (FlatpakDir          *self,
           if (child_repo == NULL)
             return FALSE;
 
+          flatpak_dir_system_helper_call_passfd (self, 0, installation ? installation : "", cancellable, error);
           flatpak_flags |= FLATPAK_PULL_FLAGS_SIDELOAD_EXTRA_DATA;
 
           /* Don’t resolve a rev or OstreeRepoFinderResult set early; the pull

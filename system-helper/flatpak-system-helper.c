@@ -25,6 +25,7 @@
 #include <string.h>
 #include <gio/gio.h>
 #include <polkit/polkit.h>
+#include <sys/socket.h>
 
 #include "flatpak-dbus-generated.h"
 #include "flatpak-dir-private.h"
@@ -1154,6 +1155,43 @@ handle_run_triggers (FlatpakSystemHelper   *object,
 }
 
 static gboolean
+handle_pass_fd (FlatpakSystemHelper   *object,
+                GDBusMethodInvocation *invocation,
+                guint                  arg_flags,
+                const gchar           *arg_installation)
+{
+  g_autoptr(FlatpakDir) system = NULL;
+  GUnixFDList *fd_list;
+  int sockets[2];
+  g_autoptr (GError) error = NULL;
+  gint fd_index;
+
+  g_debug ("passfd %u %s", arg_flags, arg_installation);
+
+  system = dir_get_system (arg_installation, get_sender_pid (invocation), &error);
+  if (system == NULL)
+    {
+      g_dbus_method_invocation_return_gerror (invocation, error);
+      return TRUE;
+    }
+
+  socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sockets);
+  close (sockets[0]);
+  fd_list = g_unix_fd_list_new ();
+  fd_index = g_unix_fd_list_append (fd_list, sockets[1], &error);
+  if (fd_index == -1)
+    {
+      g_dbus_method_invocation_return_gerror (invocation, error);
+      return TRUE;
+    }
+
+  flatpak_system_helper_complete_passfd (object,
+                                          invocation,
+                                          fd_list,
+                                          g_variant_new_handle (fd_index));
+}
+
+static gboolean
 handle_update_summary (FlatpakSystemHelper   *object,
                        GDBusMethodInvocation *invocation,
                        guint                  arg_flags,
@@ -1443,7 +1481,8 @@ flatpak_authorize_method_handler (GDBusInterfaceSkeleton *interface,
   else if (g_strcmp0 (method_name, "RemoveLocalRef") == 0 ||
            g_strcmp0 (method_name, "PruneLocalRepo") == 0 ||
            g_strcmp0 (method_name, "EnsureRepo") == 0 ||
-           g_strcmp0 (method_name, "RunTriggers") == 0)
+           g_strcmp0 (method_name, "RunTriggers") == 0 ||
+           g_strcmp0 (method_name, "passfd") == 0)
     {
       guint32 flags;
 
@@ -1529,6 +1568,7 @@ on_bus_acquired (GDBusConnection *connection,
   g_signal_connect (helper, "handle-run-triggers", G_CALLBACK (handle_run_triggers), NULL);
   g_signal_connect (helper, "handle-update-summary", G_CALLBACK (handle_update_summary), NULL);
   g_signal_connect (helper, "handle-generate-oci-summary", G_CALLBACK (handle_generate_oci_summary), NULL);
+  g_signal_connect (helper, "handle-passfd", G_CALLBACK (handle_pass_fd), NULL);
 
   g_signal_connect (helper, "g-authorize-method",
                     G_CALLBACK (flatpak_authorize_method_handler),
