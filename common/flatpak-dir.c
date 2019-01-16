@@ -1471,6 +1471,62 @@ flatpak_dir_system_helper_call_ensure_repo (FlatpakDir   *self,
 }
 
 static gboolean
+flatpak_dir_system_helper_call_get_revokefs_fd (FlatpakDir   *self,
+                                                guint         arg_flags,
+                                                const gchar  *arg_installation,
+                                                gint         *socket,
+                                                GCancellable *cancellable,
+                                                GError      **error)
+{
+  g_autoptr(GVariant) ret = NULL;
+  GUnixFDList *out_fd_list;
+  gint fd = -1;
+  gint fd_index = -1;
+
+  /* Boilerplate stolen from flatpak_dir_system_helper_call */
+  if (g_once_init_enter (&self->system_helper_bus))
+    {
+      const char *on_session = g_getenv ("FLATPAK_SYSTEM_HELPER_ON_SESSION");
+      GDBusConnection *system_helper_bus =
+        g_bus_get_sync (on_session != NULL ? G_BUS_TYPE_SESSION : G_BUS_TYPE_SYSTEM,
+                        cancellable, NULL);
+
+      /* To ensure reverse mapping */
+      flatpak_error_quark ();
+
+      g_once_init_leave (&self->system_helper_bus, system_helper_bus ? system_helper_bus : (gpointer) 1 );
+    }
+
+  if (self->system_helper_bus == (gpointer) 1)
+    {
+      flatpak_fail (error, _("Unable to connect to system bus"));
+      return FALSE;
+    }
+
+  g_debug ("Calling system helper: RevokefsFd");
+  ret = g_dbus_connection_call_with_unix_fd_list_sync (self->system_helper_bus,
+                                                       "org.freedesktop.Flatpak.SystemHelper",
+                                                       "/org/freedesktop/Flatpak/SystemHelper",
+                                                       "org.freedesktop.Flatpak.SystemHelper",
+                                                       "RevokefsFd",
+                                                       g_variant_new ("(us)", arg_flags, arg_installation),
+                                                       G_VARIANT_TYPE ("(h)"),
+                                                       G_DBUS_CALL_FLAGS_NONE,
+                                                       -1,                    /* default timeout */
+                                                        NULL,  &out_fd_list, NULL, error);
+  if (ret == NULL)
+    {
+      g_print ("Couldn't get Fd from System helper Dbus\n");
+      return FALSE;
+    }
+  g_variant_get (ret, "(h)", &fd_index);
+  fd  = g_unix_fd_list_get (out_fd_list, fd_index, NULL);
+  *socket = fd;
+
+  return TRUE;
+}
+
+static gboolean
 flatpak_dir_system_helper_call_update_summary (FlatpakDir   *self,
                                                guint         arg_flags,
                                                const gchar  *arg_installation,
@@ -7793,6 +7849,12 @@ flatpak_dir_install (FlatpakDir          *self,
         }
       else
         {
+          g_autofree gchar *arg_socket = NULL;
+          g_autoptr (GError) local_error = NULL;
+          g_autoptr (GSubprocess) revokefs_fuse = NULL;
+          gint exit_status = -1;
+          gint socket = -1;
+
           /* We're pulling from a remote source, we do the network mirroring pull as a
              user and hand back the resulting data to the system-helper, that trusts us
              due to the GPG signatures in the repo */
@@ -7800,6 +7862,38 @@ flatpak_dir_install (FlatpakDir          *self,
           child_repo = flatpak_dir_create_system_child_repo (self, &child_repo_lock, NULL, error);
           if (child_repo == NULL)
             return FALSE;
+
+          flatpak_dir_system_helper_call_get_revokefs_fd (self, 0, installation ? installation : "",
+                                                          &socket, cancellable, error);
+          g_print ("Got FD from system helper: %d\n", socket);
+          fcntl (socket, F_SETFD, 0);
+
+          arg_socket = g_strdup_printf ("--socket=%d", socket);
+          revokefs_fuse  = g_subprocess_new (G_SUBPROCESS_FLAGS_NONE,
+                                            &local_error,
+                                            "./revokefs-fuse", "-o", "uid=1000,gid=1000", arg_socket,
+                                            "/var/tmp/src", "/var/tmp/mnt", NULL);
+          if (local_error != NULL)
+            {
+              g_warning ("Error spwaning revokefs: %s\n", local_error->message);
+              return FALSE;
+            }
+
+          if (!g_subprocess_wait (revokefs_fuse, NULL, &local_error))
+            {
+              g_warning ("g_subprocess_wait on revokefs-fuse failed: %s\n", local_error->message);
+              return FALSE;
+            }
+
+          exit_status = g_subprocess_get_exit_status (revokefs_fuse);
+          g_print ("Revokefs-fuse exit status : %d\n", exit_status);
+
+          /* Now, try to mkdir on the fuse mount and fail */
+          if (g_mkdir_with_parents ("/var/tmp/mnt/hello", 0755) == -1)
+            {
+              glnx_set_error_from_errno (&local_error);
+              g_warning ("Error creating /var/tmp/mnt/hello: %s\n", local_error->message);
+            }
 
           flatpak_flags |= FLATPAK_PULL_FLAGS_SIDELOAD_EXTRA_DATA;
 
