@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <sys/file.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <utime.h>
 
 #include <glib/gi18n-lib.h>
@@ -1154,6 +1155,32 @@ flatpak_dir_remove_oci_files (FlatpakDir   *self,
 }
 
 static gboolean
+flatpak_dir_revokefs_fuse_umount (OstreeRepo **repo,
+                                  GLnxLockFile *lockfile,
+                                  const gchar *mountpoint,
+                                  GError **error)
+{
+  g_autoptr(GSubprocess) fusermount = NULL;
+  g_autoptr(GSubprocessLauncher) launcher = NULL;
+
+  /* Clear references to child_repo as not to leave any open fds. This is needed for
+   * a clean umount operation.
+   */
+  g_clear_pointer (repo, g_object_unref);
+  glnx_release_lock_file (lockfile);
+
+  launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_NONE);
+  fusermount = g_subprocess_launcher_spawn (launcher,
+                                            error,
+                                            "fusermount", "-u", mountpoint,
+                                            NULL);
+  if (g_subprocess_wait_check (fusermount, NULL, error))
+    return TRUE;
+
+  return FALSE;
+}
+
+static gboolean
 flatpak_dir_use_system_helper (FlatpakDir *self,
                                const char *installing_from_remote)
 {
@@ -1499,6 +1526,56 @@ flatpak_dir_system_helper_call_ensure_repo (FlatpakDir   *self,
                                     NULL, NULL,
                                     cancellable, error);
   return ret != NULL;
+}
+
+static gboolean
+flatpak_dir_system_helper_call_get_revokefs_fd (FlatpakDir   *self,
+                                                guint         arg_flags,
+                                                const gchar  *arg_ref,
+                                                const gchar  *arg_commit,
+                                                const gchar  *arg_installation,
+                                                gint         *out_socket,
+                                                gchar       **out_src,
+                                                gchar       **out_mountpoint,
+                                                gboolean     *out_partial_pull_availablity,
+                                                gchar       **out_partial_pull_repo,
+                                                GCancellable *cancellable,
+                                                GError      **error)
+{
+  g_autoptr(GUnixFDList) out_fd_list = NULL;
+  gint fd = -1;
+  gint fd_index = -1;
+
+  if (flatpak_dir_get_no_interaction (self))
+    arg_flags |= FLATPAK_HELPER_GET_REVOKEFS_FD_FLAGS_NO_INTERACTION;
+
+  g_debug ("Calling system helper: RevokefsFd");
+
+  g_autoptr(GVariant) ret =
+    flatpak_dir_system_helper_call (self, "RevokefsFd",
+                                    g_variant_new ("(usss)",
+                                                   arg_flags,
+                                                   arg_ref,
+                                                   arg_commit,
+                                                   arg_installation),
+                                    &out_fd_list,
+                                    G_VARIANT_TYPE ("(hssbs)"),
+                                    cancellable, error);
+
+  if (ret == NULL)
+    return FALSE;
+
+  g_variant_get (ret,
+                 "(hssbs)",
+                 &fd_index,
+                 out_src,
+                 out_mountpoint,
+                 out_partial_pull_availablity,
+                 out_partial_pull_repo);
+  fd  = g_unix_fd_list_get (out_fd_list, fd_index, NULL);
+  *out_socket = fd;
+
+  return TRUE;
 }
 
 static gboolean
@@ -4999,6 +5076,7 @@ flatpak_dir_pull_untrusted_local (FlatpakDir          *self,
   if (!g_file_load_contents (summary_file, cancellable,
                              &summary_data, &summary_data_size, NULL, NULL))
     return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_DATA, _("No summary found"));
+
   summary_bytes = g_bytes_new_take (summary_data, summary_data_size);
 
   if (gpg_verify_summary)
@@ -7826,13 +7904,77 @@ flatpak_dir_install (FlatpakDir          *self,
         }
       else
         {
-          /* We're pulling from a remote source, we do the network mirroring pull as a
-             user and hand back the resulting data to the system-helper, that trusts us
-             due to the GPG signatures in the repo */
+          g_autoptr (GError) local_error = NULL;
+          g_autofree gchar *srcdir = NULL;
+          g_autofree gchar *mountpoint = NULL;
+          g_autofree gchar *partial_pull_repo = NULL;
+          gboolean partial_pull_availablity = FALSE;
+          g_autoptr(GSubprocess) revokefs_fuse = NULL;
+          gint socket = -1;
 
-          child_repo = flatpak_dir_create_system_child_repo (self, &child_repo_lock, NULL, error);
+          if (!flatpak_dir_system_helper_call_get_revokefs_fd (self,
+                                                               0,
+                                                               ref,
+                                                               opt_commit,
+                                                               installation ? installation : "",
+                                                               &socket,
+                                                               &srcdir,
+                                                               &mountpoint,
+                                                               &partial_pull_availablity,
+                                                               &partial_pull_repo,
+                                                               cancellable,
+                                                               &local_error))
+            {
+              if (g_error_matches (local_error, G_DBUS_ERROR, G_DBUS_ERROR_NOT_SUPPORTED))
+                g_debug ("revokefs-fuse not supported on your installation: %s", local_error->message);
+              else
+                g_warning ("Failed to get revokefs socket from system-helper: %s", local_error->message);
+            }
+          else
+            {
+              g_autoptr(GSubprocessLauncher) launcher = NULL;
+              g_autofree gchar *client_uid = NULL;
+              g_autofree gchar *revokefs_fuse_path = NULL;
+
+              revokefs_fuse_path = g_find_program_in_path ("revokefs-fuse");
+
+              client_uid = g_strdup_printf ("uid=%d", getuid ());
+              launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_NONE);
+              g_subprocess_launcher_take_fd (launcher, socket, 3);
+              revokefs_fuse  = g_subprocess_launcher_spawn (launcher,
+                                                            &local_error,
+                                                            revokefs_fuse_path, "-o", client_uid, "-s", "--socket=3",
+                                                            srcdir, mountpoint, NULL);
+              if (local_error != NULL)
+                {
+                  g_warning ("Error spawning revokefs: %s", local_error->message);
+                  g_clear_error (&local_error);
+                }
+
+              if (revokefs_fuse && g_subprocess_wait_check (revokefs_fuse, NULL, &local_error))
+                {
+                  /* Create the child repo on the revokefs mountpoint */
+                  g_autoptr (GFile) mountpoint_file = g_file_new_for_path (mountpoint);
+
+                  child_repo = flatpak_dir_create_child_repo (self, mountpoint_file, &child_repo_lock, opt_commit, &local_error);
+                  if (child_repo == NULL)
+                    g_warning ("Cannot create repo on revokefs mountpoint %s: %s", mountpoint, local_error->message);
+                }
+              else
+                {
+                  g_warning ("Something went wrong with revokefs");
+                }
+            }
+
           if (child_repo == NULL)
-            return FALSE;
+            {
+             /* We're pulling from a remote source, we do the network mirroring pull as a
+                user and hand back the resulting data to the system-helper, that trusts us
+                due to the GPG signatures in the repo */
+              child_repo = flatpak_dir_create_system_child_repo (self, &child_repo_lock, NULL, error);
+              if (child_repo == NULL)
+                return FALSE;
+            }
 
           flatpak_flags |= FLATPAK_PULL_FLAGS_SIDELOAD_EXTRA_DATA;
 
@@ -7846,7 +7988,12 @@ flatpak_dir_install (FlatpakDir          *self,
           if (!child_repo_ensure_summary (child_repo, state, cancellable, error))
             return FALSE;
 
+
           child_repo_path = g_file_get_path (ostree_repo_get_path (child_repo));
+
+          if (revokefs_fuse &&
+              !flatpak_dir_revokefs_fuse_umount (&child_repo, &child_repo_lock, mountpoint, &local_error))
+            g_warning ("Could not unmount revokefs-fuse filesystem at %s: %s", mountpoint, local_error->message);
         }
 
       if (no_deploy)
