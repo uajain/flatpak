@@ -26,6 +26,10 @@
 #include <gio/gio.h>
 #include <glib/gprintf.h>
 #include <polkit/polkit.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <pwd.h>
+#include <gio/gunixfdlist.h>
 
 #include "flatpak-dbus-generated.h"
 #include "flatpak-dir-private.h"
@@ -240,7 +244,7 @@ handle_deploy (FlatpakSystemHelper   *object,
 
   g_debug ("Deploy %s %u %s %s %s", arg_repo_path, arg_flags, arg_ref, arg_origin, arg_installation);
 
-  system = dir_get_system (arg_installation, get_sender_pid (invocation), &error);
+  system = dir_get_system ("", get_sender_pid (invocation), &error);
   if (system == NULL)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
@@ -1150,6 +1154,111 @@ handle_run_triggers (FlatpakSystemHelper   *object,
 
   return TRUE;
 }
+static void
+revokefs_child_setup (gpointer user_data)
+{
+  struct passwd *passwd = getpwnam("flatpak");
+  setgid (passwd->pw_gid);
+  setuid (passwd->pw_uid);
+
+  close (GPOINTER_TO_INT(user_data));
+}
+
+static gboolean
+handle_revokefs_fd (FlatpakSystemHelper   *object,
+                    GDBusMethodInvocation *invocation,
+                    GUnixFDList           *arg_fdlist,
+                    guint                  arg_flags,
+                    const gchar           *arg_ref,
+                    const gchar           *arg_commit,
+                    const gchar           *arg_installation)
+{
+  g_autoptr(FlatpakDir) system = NULL;
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *src = NULL;
+  g_autoptr (GFile) src_file = NULL;
+  g_autofree gchar *mnt = NULL;
+  g_autoptr (GFile) mnt_file = NULL;
+  g_autoptr(GSubprocessLauncher) launcher = NULL;
+  g_autoptr (GSubprocess) revokefs_backend = NULL;
+  g_autoptr (GUnixFDList) fd_list = NULL;
+  g_autoptr (GVariant) variant = NULL;
+  int fd_index = -1;
+  int exit_status= -1;
+  int sockets[2];
+
+  g_debug ("RevokefsFd %u %s %s %s", arg_flags, arg_ref, arg_commit, arg_installation);
+
+  system = dir_get_system (arg_installation, get_sender_pid (invocation), &error);
+  if (system == NULL)
+    {
+      g_dbus_method_invocation_return_gerror (invocation, error);
+      return TRUE;
+    }
+
+  src = g_strdup ("/var/tmp/src");
+  src_file = g_file_new_for_path (src);
+
+  if (!g_file_query_exists (src_file, NULL))
+    g_mkdir_with_parents (src, 0755);
+
+  struct passwd *passwd = getpwnam("flatpak");
+  chown (src, passwd->pw_uid, passwd->pw_gid);
+
+  mnt = g_strdup ("/var/tmp/mnt");
+  mnt_file = g_file_new_for_path (mnt);
+
+  if (!g_file_query_exists (mnt_file, NULL))
+    g_mkdir_with_parents (mnt, 0755);
+  chown (mnt, 1000, 1000); // get uid from caller and pass it here
+
+  if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sockets) == -1)
+    {
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+                                             "Syscall socketpair failed");
+      return TRUE;
+    }
+
+  launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_NONE);
+  g_subprocess_launcher_set_child_setup (launcher,
+                                         revokefs_child_setup, GINT_TO_POINTER (sockets[1]),
+                                         NULL);
+  g_subprocess_launcher_take_fd (launcher, sockets[0], 3);
+  g_autofree gchar *target_socket = g_strdup ("--socket=3");
+  revokefs_backend = g_subprocess_launcher_spawn (launcher,
+                                                  &error,
+                                                  "./revokefs-fuse",
+                                                  "--backend",
+                                                  target_socket, src, NULL);
+  if (revokefs_backend == NULL)
+    {
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_SPAWN_FAILED,
+                                             "Could not spawn revokefs backend: %s", error->message);
+      return TRUE;
+    }
+  /*
+  g_print ("Waiting\n");
+  if (!g_subprocess_wait (revokefs_backend, NULL, &error))
+    {
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+                                             "g_subprocess_wait failed: %s", error->message);
+      return TRUE;
+    }
+
+  exit_status = g_subprocess_get_exit_status (revokefs_backend);
+  g_print ("Revokefs backend exit status : %d\n", exit_status);
+  */
+
+  /* Pass the other end to the client */
+  fd_list = g_unix_fd_list_new ();
+  fd_index = g_unix_fd_list_append (fd_list, sockets[1], NULL);
+
+  variant = g_variant_ref_sink (g_variant_new ("(hss)", fd_index, src, mnt));
+  flatpak_system_helper_complete_revokefs_fd (object, invocation, fd_list,
+                                              g_variant_new_handle (fd_index), src, mnt);
+
+  return TRUE;
+}
 
 static gboolean
 handle_update_summary (FlatpakSystemHelper   *object,
@@ -1440,7 +1549,8 @@ flatpak_authorize_method_handler (GDBusInterfaceSkeleton *interface,
   else if (g_strcmp0 (method_name, "RemoveLocalRef") == 0 ||
            g_strcmp0 (method_name, "PruneLocalRepo") == 0 ||
            g_strcmp0 (method_name, "EnsureRepo") == 0 ||
-           g_strcmp0 (method_name, "RunTriggers") == 0)
+           g_strcmp0 (method_name, "RunTriggers") == 0 ||
+           g_strcmp0 (method_name, "RevokefsFd") == 0)
     {
       guint32 flags;
 
@@ -1526,6 +1636,7 @@ on_bus_acquired (GDBusConnection *connection,
   g_signal_connect (helper, "handle-run-triggers", G_CALLBACK (handle_run_triggers), NULL);
   g_signal_connect (helper, "handle-update-summary", G_CALLBACK (handle_update_summary), NULL);
   g_signal_connect (helper, "handle-generate-oci-summary", G_CALLBACK (handle_generate_oci_summary), NULL);
+  g_signal_connect (helper, "handle-revokefs-fd", G_CALLBACK (handle_revokefs_fd), NULL);
 
   g_signal_connect (helper, "g-authorize-method",
                     G_CALLBACK (flatpak_authorize_method_handler),
