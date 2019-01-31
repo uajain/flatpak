@@ -1556,6 +1556,31 @@ flatpak_dir_system_helper_call_ensure_repo (FlatpakDir   *self,
 }
 
 static gboolean
+flatpak_dir_system_helper_call_cancel_pull (FlatpakDir    *self,
+                                            guint          arg_flags,
+                                            const gchar   *arg_installation,
+                                            const gchar   *arg_src_dir,
+                                            GCancellable  *cancellable,
+                                            GError       **error)
+{
+  if (flatpak_dir_get_no_interaction (self))
+    arg_flags |= FLATPAK_HELPER_CANCEL_PULL_FLAGS_NO_INTERACTION;
+
+  g_debug ("Calling system helper: CancelPull");
+
+  g_autoptr(GVariant) ret =
+    flatpak_dir_system_helper_call (self, "CancelPull",
+                                    g_variant_new ("(uss)",
+                                                   arg_flags,
+                                                   arg_installation,
+                                                   arg_src_dir),
+                                    NULL, NULL,
+                                    cancellable, error);
+
+   return ret != NULL;
+}
+
+static gboolean
 flatpak_dir_system_helper_call_get_revokefs_fd (FlatpakDir   *self,
                                                 guint         arg_flags,
                                                 const gchar  *arg_ref,
@@ -7831,6 +7856,22 @@ flatpak_dir_create_system_child_repo (FlatpakDir   *self,
   return flatpak_dir_create_child_repo (self, cache_dir, file_lock, optional_commit, error);
 }
 
+static void
+flatpak_dir_cancel_pull (FlatpakDir   *self,
+                         guint         arg_flags,
+                         GCancellable *cancellable,
+                         const char   *src_dir)
+{
+  const char *installation = flatpak_dir_get_id (self);
+  g_autoptr(GError) error = NULL;
+
+  if (!flatpak_dir_system_helper_call_cancel_pull (self,
+                                                   arg_flags,
+                                                   installation ? installation : "",
+                                                   src_dir, cancellable, &error))
+    g_debug ("Error cancelling ongoing pull at %s: %s", src_dir, error->message);
+}
+
 gboolean
 flatpak_dir_install (FlatpakDir          *self,
                      gboolean             no_pull,
@@ -7956,6 +7997,7 @@ flatpak_dir_install (FlatpakDir          *self,
               if (mountpoint == NULL)
                 {
                   g_warning ("Failed to create a mountpoint for revokefs-fuse: %s", local_error->message);
+                  flatpak_dir_cancel_pull (self, FLATPAK_HELPER_CANCEL_PULL_FLAGS_NONE, cancellable, src_dir);
                   goto pull_fallback;
                 }
 
@@ -7970,6 +8012,7 @@ flatpak_dir_install (FlatpakDir          *self,
                   !g_subprocess_wait_check (revokefs_fuse, NULL, &local_error))
                 {
                   g_warning ("Error spawning revokefs-fuse: %s", local_error->message);
+                  flatpak_dir_cancel_pull (self, FLATPAK_HELPER_CANCEL_PULL_FLAGS_NONE, cancellable, src_dir);
                   goto pull_fallback;
                 }
 
@@ -7979,6 +8022,7 @@ flatpak_dir_install (FlatpakDir          *self,
               if (child_repo == NULL)
                 {
                   g_warning ("Cannot create repo on revokefs mountpoint %s: %s", mountpoint, local_error->message);
+                  flatpak_dir_cancel_pull (self, FLATPAK_HELPER_CANCEL_PULL_FLAGS_NONE, cancellable, src_dir);
                   goto pull_fallback;
                 }
 
@@ -8006,7 +8050,21 @@ pull_fallback:
                                  flatpak_flags,
                                  OSTREE_REPO_PULL_FLAGS_MIRROR,
                                  progress, cancellable, error))
-            return FALSE;
+            {
+              if (revokefs_fuse)
+                {
+                  g_autofree gchar *repo_path = NULL;
+
+                  repo_path = g_file_get_path (ostree_repo_get_path (child_repo));
+
+                  if (!flatpak_dir_revokefs_fuse_umount (&child_repo, &child_repo_lock, mountpoint, &local_error))
+                    g_warning ("Could not unmount revokefs-fuse filesystem at %s: %s", mountpoint, local_error->message);
+
+                  flatpak_dir_cancel_pull (self, FLATPAK_HELPER_CANCEL_PULL_FLAGS_PRESERVE_PULL, cancellable, src_dir);
+                }
+
+              return FALSE;
+            }
 
           if (!child_repo_ensure_summary (child_repo, state, cancellable, error))
             return FALSE;
