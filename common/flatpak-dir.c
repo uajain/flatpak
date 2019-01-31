@@ -1204,8 +1204,11 @@ flatpak_dir_revokefs_fuse_unmount (OstreeRepo **repo,
   if (g_subprocess_wait_check (fusermount, NULL, error))
     {
       g_autoptr(GFile) mnt_dir_file = g_file_new_for_path (mnt_dir);
+      g_autoptr(GError) tmp_error = NULL;
 
-      flatpak_rm_rf (mnt_dir_file, NULL, NULL);
+      if (!flatpak_rm_rf (mnt_dir_file, NULL, &tmp_error))
+        g_warning ("Unable to remove mountpoint directory %s: %s", mnt_dir, tmp_error->message);
+
       return TRUE;
     }
 
@@ -1543,6 +1546,31 @@ flatpak_dir_system_helper_call_ensure_repo (FlatpakDir   *self,
                                     G_VARIANT_TYPE ("()"), NULL,
                                     cancellable, error);
   return ret != NULL;
+}
+
+static gboolean
+flatpak_dir_system_helper_call_cancel_pull (FlatpakDir    *self,
+                                            guint          arg_flags,
+                                            const gchar   *arg_installation,
+                                            const gchar   *arg_src_dir,
+                                            GCancellable  *cancellable,
+                                            GError       **error)
+{
+  if (flatpak_dir_get_no_interaction (self))
+    arg_flags |= FLATPAK_HELPER_CANCEL_PULL_FLAGS_NO_INTERACTION;
+
+  g_debug ("Calling system helper: CancelPull");
+
+  g_autoptr(GVariant) ret =
+    flatpak_dir_system_helper_call (self, "CancelPull",
+                                    g_variant_new ("(uss)",
+                                                   arg_flags,
+                                                   arg_installation,
+                                                   arg_src_dir),
+                                    NULL, NULL,
+                                    cancellable, error);
+
+   return ret != NULL;
 }
 
 static gboolean
@@ -7885,6 +7913,32 @@ out:
   return res;
 }
 
+static void
+flatpak_dir_unmount_and_cancel_pull (FlatpakDir    *self,
+                                     guint          arg_flags,
+                                     GCancellable  *cancellable,
+                                     OstreeRepo   **repo,
+                                     GLnxLockFile  *lockfile,
+                                     const char    *mnt_dir,
+                                     const char    *src_dir)
+{
+  const char *installation = flatpak_dir_get_id (self);
+  g_autoptr(GError) error = NULL;
+
+  if (mnt_dir &&
+      !flatpak_dir_revokefs_fuse_unmount (repo, lockfile, mnt_dir, &error))
+    g_warning ("Could not unmount revokefs-fuse filesystem at %s: %s", mnt_dir, error->message);
+
+  g_clear_error (&error);
+
+  if (src_dir &&
+      !flatpak_dir_system_helper_call_cancel_pull (self,
+                                                   arg_flags,
+                                                   installation ? installation : "",
+                                                   src_dir, cancellable, &error))
+    g_warning ("Error cancelling ongoing pull at %s: %s", src_dir, error->message);
+}
+
 gboolean
 flatpak_dir_install (FlatpakDir          *self,
                      gboolean             no_pull,
@@ -8009,7 +8063,10 @@ flatpak_dir_install (FlatpakDir          *self,
                                                       &src_dir, &mnt_dir,
                                                       cancellable))
             {
-              /* Error handling for failure */
+              flatpak_dir_unmount_and_cancel_pull (self, FLATPAK_HELPER_CANCEL_PULL_FLAGS_NONE,
+                                                   cancellable,
+                                                   &child_repo, &child_repo_lock,
+                                                   mnt_dir, src_dir);
             }
           else
             {
@@ -8021,6 +8078,12 @@ flatpak_dir_install (FlatpakDir          *self,
               if (child_repo == NULL)
                 {
                   g_warning ("Cannot create repo on revokefs mountpoint %s: %s", mnt_dir, local_error->message);
+                  flatpak_dir_unmount_and_cancel_pull (self,
+                                                       FLATPAK_HELPER_CANCEL_PULL_FLAGS_NONE,
+                                                       cancellable,
+                                                       &child_repo, &child_repo_lock,
+                                                       mnt_dir, src_dir);
+                  g_clear_error (&local_error);
                 }
               else
                 {
@@ -8051,10 +8114,32 @@ flatpak_dir_install (FlatpakDir          *self,
                                  flatpak_flags,
                                  OSTREE_REPO_PULL_FLAGS_MIRROR,
                                  progress, cancellable, error))
-            return FALSE;
+            {
+              if (is_revokefs_pull)
+                {
+                  flatpak_dir_unmount_and_cancel_pull (self,
+                                                       FLATPAK_HELPER_CANCEL_PULL_FLAGS_PRESERVE_PULL,
+                                                       cancellable,
+                                                       &child_repo, &child_repo_lock,
+                                                       mnt_dir, src_dir);
+                }
+
+              return FALSE;
+            }
 
           if (!child_repo_ensure_summary (child_repo, state, cancellable, error))
-            return FALSE;
+            {
+              if (is_revokefs_pull)
+                {
+                  flatpak_dir_unmount_and_cancel_pull (self,
+                                                       FLATPAK_HELPER_CANCEL_PULL_FLAGS_PRESERVE_PULL,
+                                                       cancellable,
+                                                       &child_repo, &child_repo_lock,
+                                                       mnt_dir, src_dir);
+                }
+
+              return FALSE;
+            }
 
           g_assert (child_repo_path != NULL);
 
@@ -8062,6 +8147,11 @@ flatpak_dir_install (FlatpakDir          *self,
               !flatpak_dir_revokefs_fuse_unmount (&child_repo, &child_repo_lock, mnt_dir, &local_error))
             {
               g_warning ("Could not unmount revokefs-fuse filesystem at %s: %s", mnt_dir, local_error->message);
+              flatpak_dir_unmount_and_cancel_pull (self,
+                                                   FLATPAK_HELPER_CANCEL_PULL_FLAGS_PRESERVE_PULL,
+                                                   cancellable,
+                                                   &child_repo, &child_repo_lock,
+                                                   mnt_dir, src_dir);
               return FALSE;
             }
         }
