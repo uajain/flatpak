@@ -65,6 +65,7 @@ typedef struct
   FlatpakSystemHelper *object;
   GDBusMethodInvocation *invocation;
   GCancellable *cancellable;
+  gboolean preserve_pull;
 
   guint watch_id;
   uid_t uid;
@@ -100,16 +101,19 @@ ongoing_pull_free (OngoingPull *pull)
       g_clear_object (&pull->revokefs_backend);
     }
 
-  if (!flatpak_rm_rf (src_dir_file, NULL, &local_error))
+  if (!pull->preserve_pull)
     {
-      g_warning ("Unable to remove ongoing pull's src dir at: %s", local_error->message);
-      g_clear_error (&local_error);
-    }
+      if (!flatpak_rm_rf (src_dir_file, NULL, &local_error))
+        {
+          g_warning ("Unable to remove ongoing pull's src dir at %s", local_error->message);
+          g_clear_error (&local_error);
+        }
 
-   if (!flatpak_rm_rf (mountpoint_file, NULL, &local_error))
-    {
-      g_warning ("Unable to remove ongoing pull's mountpoint at: %s", local_error->message);
-      g_clear_error (&local_error);
+       if (!flatpak_rm_rf (mountpoint_file, NULL, &local_error))
+        {
+          g_warning ("Unable to remove ongoing pull's mountpoint at %s", local_error->message);
+          g_clear_error (&local_error);
+        }
     }
 
   g_clear_pointer (&pull->src_dir, g_free);
@@ -618,6 +622,41 @@ handle_deploy (FlatpakSystemHelper   *object,
   flatpak_system_helper_complete_deploy (object, invocation);
 
   return TRUE;
+}
+
+static gboolean
+handle_cancel_pull (FlatpakSystemHelper   *object,
+                    GDBusMethodInvocation *invocation,
+                    guint                  arg_flags,
+                    const gchar           *arg_installation,
+                    const gchar           *arg_repo_path)
+{
+  OngoingPull *ongoing_pull;
+  g_autoptr(FlatpakDir) system = NULL;
+  g_autoptr(GError) error = NULL;
+
+  g_debug ("CancelPull %s %u %s", arg_installation, arg_flags, arg_repo_path);
+
+  system = dir_get_system (arg_installation, get_sender_pid (invocation), &error);
+  if (system == NULL)
+    {
+      g_dbus_method_invocation_return_gerror (invocation, error);
+      return TRUE;
+    }
+
+  ongoing_pull = take_ongoing_pull_by_dir (arg_repo_path);
+  if (ongoing_pull == NULL)
+    {
+      g_warning ("Cannot find ongoing pull to cancel at: %s", arg_repo_path);
+      goto out;
+    }
+  ongoing_pull->preserve_pull = (arg_flags & FLATPAK_HELPER_CANCEL_PULL_FLAGS_PRESERVE_PULL) != 0;
+  ongoing_pull_free (ongoing_pull);
+
+out:
+  flatpak_system_helper_complete_cancel_pull (object, invocation);
+
+   return TRUE;
 }
 
 static gboolean
@@ -1360,6 +1399,7 @@ ongoing_pull_new (FlatpakSystemHelper   *object,
   pull->mountpoint = g_strdup (mnt);
   pull->cancellable = g_cancellable_new ();
   pull->uid = uid;
+  pull->preserve_pull = FALSE;
 
   pull->watch_id = g_bus_watch_name_on_connection (connection,
                                                    g_dbus_connection_get_unique_name (connection),
@@ -1929,7 +1969,8 @@ flatpak_authorize_method_handler (GDBusInterfaceSkeleton *interface,
            g_strcmp0 (method_name, "PruneLocalRepo") == 0 ||
            g_strcmp0 (method_name, "EnsureRepo") == 0 ||
            g_strcmp0 (method_name, "RunTriggers") == 0 ||
-           g_strcmp0 (method_name, "RevokefsFd") == 0)
+           g_strcmp0 (method_name, "RevokefsFd") == 0 ||
+           g_strcmp0 (method_name, "CancelPull") == 0)
     {
       guint32 flags;
 
@@ -2016,6 +2057,7 @@ on_bus_acquired (GDBusConnection *connection,
   g_signal_connect (helper, "handle-update-summary", G_CALLBACK (handle_update_summary), NULL);
   g_signal_connect (helper, "handle-generate-oci-summary", G_CALLBACK (handle_generate_oci_summary), NULL);
   g_signal_connect (helper, "handle-revokefs-fd", G_CALLBACK (handle_revokefs_fd), NULL);
+  g_signal_connect (helper, "handle-cancel-pull", G_CALLBACK (handle_cancel_pull), NULL);
 
   g_signal_connect (helper, "g-authorize-method",
                     G_CALLBACK (flatpak_authorize_method_handler),

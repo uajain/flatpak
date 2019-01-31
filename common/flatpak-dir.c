@@ -1529,6 +1529,31 @@ flatpak_dir_system_helper_call_ensure_repo (FlatpakDir   *self,
 }
 
 static gboolean
+flatpak_dir_system_helper_call_cancel_pull (FlatpakDir    *self,
+                                            guint          arg_flags,
+                                            const gchar   *arg_installation,
+                                            const gchar   *arg_repo_path,
+                                            GCancellable  *cancellable,
+                                            GError       **error)
+{
+  if (flatpak_dir_get_no_interaction (self))
+    arg_flags |= FLATPAK_HELPER_CANCEL_PULL_FLAGS_NO_INTERACTION;
+
+  g_debug ("Calling system helper: CancelPull");
+
+  g_autoptr(GVariant) ret =
+    flatpak_dir_system_helper_call (self, "CancelPull",
+                                    g_variant_new ("(uss)",
+                                                   arg_flags,
+                                                   arg_installation,
+                                                   arg_repo_path),
+                                    NULL, NULL,
+                                    cancellable, error);
+
+   return ret != NULL;
+}
+
+static gboolean
 flatpak_dir_system_helper_call_get_revokefs_fd (FlatpakDir   *self,
                                                 guint         arg_flags,
                                                 const gchar  *arg_ref,
@@ -7811,6 +7836,22 @@ flatpak_dir_create_system_child_repo (FlatpakDir   *self,
   return flatpak_dir_create_child_repo (self, cache_dir, file_lock, optional_commit, error);
 }
 
+static void
+flatpak_dir_cancel_pull (FlatpakDir *self,
+                         guint arg_flags,
+                         GCancellable *cancellable,
+                         const char *repo_path)
+{
+  const char *installation = flatpak_dir_get_id (self);
+  g_autoptr(GError) error = NULL;
+
+   if (!flatpak_dir_system_helper_call_cancel_pull (self,
+                                                    arg_flags,
+                                                    installation ? installation : "",
+                                                    repo_path, cancellable, &error))
+    g_debug ("Error cancelling ongoing pull at %s: %s", repo_path, error->message);
+}
+
 gboolean
 flatpak_dir_install (FlatpakDir          *self,
                      gboolean             no_pull,
@@ -7983,7 +8024,26 @@ flatpak_dir_install (FlatpakDir          *self,
                                  flatpak_flags,
                                  OSTREE_REPO_PULL_FLAGS_MIRROR,
                                  progress, cancellable, error))
-            return FALSE;
+            {
+              if (revokefs_fuse)
+                {
+                  g_autofree gchar *repo_path = NULL;
+
+                  repo_path = g_file_get_path (ostree_repo_get_path (child_repo));
+
+                  /* Clear references to child_repo as not to leave any open fds. This is needed for
+                   * a clean umount operation in system-helper's handle_cancel_pull(). */
+                  g_clear_pointer (&child_repo, g_object_unref);
+                  glnx_release_lock_file (&child_repo_lock);
+
+                  flatpak_dir_cancel_pull (self,
+                                           FLATPAK_HELPER_CANCEL_PULL_FLAGS_PRESERVE_PULL,
+                                           cancellable,
+                                           repo_path);
+                }
+
+              return FALSE;
+            }
 
           if (!child_repo_ensure_summary (child_repo, state, cancellable, error))
             return FALSE;
