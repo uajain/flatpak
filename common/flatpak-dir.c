@@ -7849,8 +7849,8 @@ static gboolean
 flatpak_dir_setup_revokefs_fuse_mount (FlatpakDir    *self,
                                        const gchar   *ref,
                                        const gchar   *installation,
-                                       gchar        **src_dir,
-                                       gchar        **mnt_dir,
+                                       gchar        **out_src_dir,
+                                       gchar        **out_mnt_dir,
                                        GCancellable  *cancellable)
 {
   g_autoptr (GError) local_error = NULL;
@@ -7907,8 +7907,14 @@ flatpak_dir_setup_revokefs_fuse_mount (FlatpakDir    *self,
   res = TRUE;
 
 out:
-  *mnt_dir = g_steal_pointer (&mnt_dir_tmp);
-  *src_dir = g_steal_pointer (&src_dir_tmp);
+  /* It is unconventional to steal these values on error. However, it depends on where
+   * this function failed. If we are able to spawn the revokefs backend (src_dir_tmp
+   * is non-NULL) but failed to create mountpoint or spawning revokefs-fuse here,
+   * we  still need the src_dir_tmp value to cleanup the revokefs backend properly
+   * through the system-helper's CancelPull(). Hence, always stealing values can tell
+   * the caller under what circumstances this function failed and cleanup accordingly. */
+  *out_mnt_dir = g_steal_pointer (&mnt_dir_tmp);
+  *out_src_dir = g_steal_pointer (&src_dir_tmp);
 
   return res;
 }

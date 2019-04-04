@@ -311,6 +311,37 @@ flatpak_invocation_return_error (GDBusMethodInvocation *invocation,
     }
 }
 
+static gboolean
+get_connection_uid (GDBusMethodInvocation *invocation, uid_t *out_uid, GError **error)
+{
+  GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
+  const gchar *sender = g_dbus_method_invocation_get_sender (invocation);
+  g_autoptr(GVariant) dict = NULL;
+  g_autoptr(GVariant) credentials = NULL;
+
+  credentials = g_dbus_connection_call_sync (connection,
+                                             "org.freedesktop.DBus",
+                                             "/org/freedesktop/DBus",
+                                             "org.freedesktop.DBus",
+                                             "GetConnectionCredentials",
+                                             g_variant_new ("(s)", sender),
+                                             G_VARIANT_TYPE ("(a{sv})"), G_DBUS_CALL_FLAGS_NONE,
+                                             G_MAXINT, NULL, error);
+  if (credentials == NULL)
+    return FALSE;
+
+  dict = g_variant_get_child_value (credentials, 0);
+
+   if (!g_variant_lookup (dict, "UnixUserID", "u", out_uid))
+    {
+      g_set_error (error, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+                   "Failed to query UnixUserID for the bus name: %s", sender);
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
 static OngoingPull *
 take_ongoing_pull_by_dir (const gchar *src_dir)
 {
@@ -325,12 +356,15 @@ take_ongoing_pull_by_dir (const gchar *src_dir)
    * callers. */
   if (g_hash_table_steal_extended (cache_dirs_in_use, src_dir, &key, &value))
     {
-      g_hash_table_insert (cache_dirs_in_use, key, NULL);
-      pull = value;
+      if (value)
+        {
+          g_hash_table_insert (cache_dirs_in_use, key, NULL);
+          pull = value;
+        }
     }
   G_UNLOCK (cache_dirs_in_use);
 
-  return g_steal_pointer (&pull);
+  return pull;
 }
 
 static gboolean
@@ -370,12 +404,28 @@ handle_deploy (FlatpakSystemHelper   *object,
   if (ongoing_pull != NULL)
     {
       g_autoptr(GError) local_error = NULL;
-      gint dir_fd = -1;
+      uid_t uid;
+
+      /* Ensure that pull's uid is same as the caller's uid */
+      if (!get_connection_uid (invocation, &uid, &local_error))
+        {
+          g_dbus_method_invocation_return_gerror (invocation, local_error);
+          return TRUE;
+        }
+      else
+        {
+          if (ongoing_pull->uid != uid)
+            {
+              g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+                                                     "Ongoing pull's uid(%d) does not match with peer uid(%d)",
+                                                     ongoing_pull->uid, uid);
+              return TRUE;
+            }
+        }
 
       terminate_revokefs_backend (ongoing_pull);
 
-      dir_fd = open (ongoing_pull->src_dir, O_DIRECTORY);
-      if (!flatpak_canonicalize_permissions (dir_fd,
+      if (!flatpak_canonicalize_permissions (AT_FDCWD,
                                              arg_repo_path,
                                              getuid() == 0 ? 0 : -1,
                                              getuid() == 0 ? 0 : -1,
@@ -645,6 +695,7 @@ handle_cancel_pull (FlatpakSystemHelper   *object,
   OngoingPull *ongoing_pull;
   g_autoptr(FlatpakDir) system = NULL;
   g_autoptr(GError) error = NULL;
+  uid_t uid;
 
   g_debug ("CancelPull %s %u %s", arg_installation, arg_flags, arg_src_dir);
 
@@ -662,6 +713,23 @@ handle_cancel_pull (FlatpakSystemHelper   *object,
                    "Cannot find ongoing pull to cancel at %s", arg_src_dir);
       g_dbus_method_invocation_return_gerror (invocation, error);
       return TRUE;
+    }
+
+  /* Ensure that pull's uid is same as the caller's uid */
+  if (!get_connection_uid (invocation, &uid, &error))
+    {
+      g_dbus_method_invocation_return_gerror (invocation, error);
+      return TRUE;
+    }
+  else
+    {
+      if (ongoing_pull->uid != uid)
+        {
+          g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+                                                 "Ongoing pull's uid(%d) does not match with peer uid(%d)",
+                                                 ongoing_pull->uid, uid);
+          return TRUE;
+        }
     }
 
   ongoing_pull->preserve_pull = (arg_flags & FLATPAK_HELPER_CANCEL_PULL_FLAGS_PRESERVE_PULL) != 0;
@@ -1333,37 +1401,6 @@ handle_run_triggers (FlatpakSystemHelper   *object,
 }
 
 static gboolean
-get_connection_uid (GDBusMethodInvocation *invocation, uid_t *out_uid, GError **error)
-{
-  GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
-  const gchar *sender = g_dbus_method_invocation_get_sender (invocation);
-  g_autoptr(GVariant) dict = NULL;
-  g_autoptr(GVariant) credentials = NULL;
-
-  credentials = g_dbus_connection_call_sync (connection,
-                                             "org.freedesktop.DBus",
-                                             "/org/freedesktop/DBus",
-                                             "org.freedesktop.DBus",
-                                             "GetConnectionCredentials",
-                                             g_variant_new ("(s)", sender),
-                                             G_VARIANT_TYPE ("(a{sv})"), G_DBUS_CALL_FLAGS_NONE,
-                                             G_MAXINT, NULL, error);
-  if (credentials == NULL)
-    return FALSE;
-
-  dict = g_variant_get_child_value (credentials, 0);
-
-   if (!g_variant_lookup (dict, "UnixUserID", "u", out_uid))
-    {
-      g_set_error (error, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
-                   "Failed to query UnixUserID for the bus name: %s", sender);
-      return FALSE;
-    }
-
-  return TRUE;
-}
-
-static gboolean
 check_for_system_helper_user (struct passwd  *passwd,
                               gchar         **passwd_buf,
                               GError        **error)
@@ -1415,12 +1452,18 @@ revokefs_fuse_backend_child_setup (gpointer user_data)
   struct passwd *passwd = user_data;
 
   if (setgid (passwd->pw_gid) == -1)
-    g_warning ("Failed to setgid(%d) for revokefs backend: %s",
-               passwd->pw_gid, g_strerror (errno));
+    {
+      g_warning ("Failed to setgid(%d) for revokefs backend: %s",
+                 passwd->pw_gid, g_strerror (errno));
+      exit (1);
+    }
 
   if (setuid (passwd->pw_uid) == -1)
-    g_warning ("Failed to setuid(%d) for revokefs backend: %s",
-               passwd->pw_uid, g_strerror (errno));
+    {
+      g_warning ("Failed to setuid(%d) for revokefs backend: %s",
+                 passwd->pw_uid, g_strerror (errno));
+      exit (1);
+    }
 }
 
 static void
