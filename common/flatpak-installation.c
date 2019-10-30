@@ -1092,7 +1092,64 @@ flatpak_installation_list_installed_refs_for_update (FlatpakInstallation *self,
       /* Note: local_commit may be NULL here */
       if (remote_commit != NULL &&
           g_strcmp0 (remote_commit, local_commit) != 0)
-        g_ptr_array_add (updates, g_object_ref (installed_ref));
+        {
+          g_ptr_array_add (updates, g_object_ref (installed_ref));
+        }
+      else if (g_str_has_prefix (full_ref, "app/"))
+        {
+          g_autoptr (GPtrArray) installed_related_refs = NULL;
+          g_autoptr (GPtrArray) remote_related_refs = NULL;
+          g_autoptr (GError) local_error = NULL;
+
+          installed_related_refs = flatpak_installation_list_installed_related_refs_sync (self,
+                                                                                          remote_name,
+                                                                                          full_ref,
+                                                                                          cancellable,
+                                                                                          &local_error);
+          if (local_error != NULL)
+            {
+              g_warning ("Unable to get installed related refs for %s: %s", full_ref, local_error->message);
+              continue;
+            }
+
+          remote_related_refs = flatpak_installation_list_remote_related_refs_sync (self,
+                                                                                    remote_name,
+                                                                                    full_ref,
+                                                                                    cancellable,
+                                                                                    &local_error);
+          if (local_error != NULL)
+            {
+              g_warning ("Unable to get remote related refs for %s: %s", full_ref, local_error->message);
+              continue;
+            }
+
+          if (remote_related_refs == NULL)
+            continue;
+
+          for (guint j = 0; j < remote_related_refs->len; j++)
+            {
+              FlatpakRelatedRef *remote_related_ref = g_ptr_array_index (remote_related_refs, j);
+              gboolean should_download = flatpak_related_ref_should_download (remote_related_ref);
+              gboolean related_ref_found = FALSE;
+
+              if (should_download && installed_related_refs != NULL)
+                {
+                  for (guint k = 0; k < installed_related_refs->len; k++)
+                    {
+                      FlatpakRelatedRef *installed_related_ref = g_ptr_array_index (installed_related_refs, k);
+                      g_autofree gchar *full_ref1 = flatpak_ref_format_ref (FLATPAK_REF (installed_related_ref));
+                      g_autofree gchar *full_ref2 = flatpak_ref_format_ref (FLATPAK_REF (remote_related_ref));
+
+                      if (g_strcmp0 (full_ref1, full_ref2) == 0)
+                        related_ref_found = TRUE;
+                    }
+
+                  if (should_download && !related_ref_found)
+                    g_ptr_array_add (updates, g_object_ref (installed_ref));
+
+                }
+            }
+        }
     }
 
   collection_refs = g_ptr_array_new_with_free_func ((GDestroyNotify) _ostree_collection_ref_free0);
