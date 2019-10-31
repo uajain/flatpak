@@ -1604,31 +1604,40 @@ test_list_updates (void)
   g_autoptr(GPtrArray) refs = NULL;
   g_autoptr(FlatpakInstalledRef) ref = NULL;
   g_autoptr(FlatpakInstalledRef) runtime_ref = NULL;
+  g_autoptr(FlatpakTransaction) transaction = NULL;
   FlatpakInstalledRef *update_ref = NULL;
   g_autoptr(FlatpakInstalledRef) updated_ref = NULL;
   gboolean res;
+  g_autofree gchar *app = NULL;
+
+  app = g_strdup_printf ("app/org.test.Hello/%s/master",
+                         flatpak_get_default_arch ());
 
   inst = flatpak_installation_new_user (NULL, &error);
   g_assert_no_error (error);
 
-  /* Install a runtime and app */
-  runtime_ref = flatpak_installation_install (inst,
-                                              repo_name,
-                                              FLATPAK_REF_KIND_RUNTIME,
-                                              "org.test.Platform",
-                                              NULL, NULL, NULL, NULL, NULL,
-                                              &error);
+  /* install org.test.Hello, and have org.test.Hello.Locale and org.test.Platform
+   * added as deps/related
+   */
+  transaction = flatpak_transaction_new_for_installation (inst, NULL, &error);
   g_assert_no_error (error);
-  g_assert (FLATPAK_IS_INSTALLED_REF (runtime_ref));
+  g_assert_nonnull (transaction);
 
-  ref = flatpak_installation_install (inst,
-                                      repo_name,
-                                      FLATPAK_REF_KIND_APP,
-                                      "org.test.Hello",
-                                      NULL, NULL, NULL, NULL, NULL,
-                                      &error);
+  res = flatpak_transaction_add_install (transaction, repo_name, app, NULL, &error);
   g_assert_no_error (error);
-  g_assert (FLATPAK_IS_INSTALLED_REF (ref));
+  g_assert_true (res);
+
+  g_assert (!flatpak_transaction_is_empty (transaction));
+
+  res = flatpak_transaction_run (transaction, NULL, &error);
+  g_assert_no_error (error);
+  g_assert_true (res);
+
+  refs = flatpak_installation_list_installed_refs (inst, NULL, &error);
+  g_assert_no_error (error);
+  g_assert_nonnull (refs);
+  g_assert_cmpint (refs->len, ==, 3);
+  g_clear_object (&refs, g_ptr_array_unref);
 
   /* Add a previous-id to the deploy file */
   mangle_deploy_file (ref);
