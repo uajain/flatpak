@@ -3585,6 +3585,44 @@ test_install_flatpakref (void)
   g_assert_nonnull (ref);
 }
 
+static void
+test_update_installed_related_refs (void)
+{
+  g_autoptr(FlatpakInstallation) inst = NULL;
+  g_autoptr(FlatpakTransaction) transaction = NULL;
+  g_autoptr(GPtrArray) updatable_refs = NULL;
+  g_autoptr(GPtrArray) refs = NULL;
+  g_autoptr(GError) error = NULL;
+  FlatpakInstalledRef *iref;
+  gboolean res;
+  g_autofree char *app = NULL;
+
+  app = g_strdup_printf ("app/org.test.Hello/%s/master",
+                         flatpak_get_default_arch ());
+
+  inst = flatpak_installation_new_user (NULL, &error);
+  g_assert_no_error (error);
+  g_assert_nonnull (inst);
+
+  empty_installation (inst);
+
+  iref = flatpak_installation_install (inst, repo_name, FLATPAK_REF_KIND_APP, "org.test.Hello", NULL, "master", NULL, NULL, NULL, &error);
+  g_assert_no_error (error);
+  g_assert_nonnull (iref);
+  g_clear_object (&iref);
+
+  /* We expect no related refs (i.e. org.test.Hello.Locale) is not installed at this point */
+  refs = flatpak_installation_list_installed_related_refs_sync (inst, repo_name, app, NULL, &error);
+  g_assert_error (error, FLATPAK_ERROR, FLATPAK_ERROR_NOT_INSTALLED);
+  g_assert_null (refs);
+  g_clear_error (&error);
+
+  updatable_refs = flatpak_installation_list_installed_refs_for_update (inst, NULL, &error);
+  g_assert (updatable_refs->len == 1);
+  iref = g_ptr_array_index (updatable_refs, 0);
+  g_assert_cmpstr (flatpak_ref_get_name (FLATPAK_REF (iref)), ==, "org.test.Hello");
+}
+
 /* test the installation method to list installed related refs */
 static void
 test_list_installed_related_refs (void)
@@ -3920,6 +3958,7 @@ main (int argc, char *argv[])
   g_test_add_func ("/library/install-bundle", test_install_bundle);
   g_test_add_func ("/library/install-flatpakref", test_install_flatpakref);
   g_test_add_func ("/library/list-installed-related-refs", test_list_installed_related_refs);
+  g_test_add_func ("/library/update-installed-related-refs", test_update_installed_related_refs);
   g_test_add_func ("/library/no-deploy", test_no_deploy);
   g_test_add_func ("/library/bad-remote-name", test_bad_remote_name);
   g_test_add_func ("/library/transaction-no-runtime", test_transaction_no_runtime);
