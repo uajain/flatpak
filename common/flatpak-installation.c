@@ -1002,6 +1002,11 @@ _ostree_collection_ref_free0 (OstreeCollectionRef *ref)
  * it can have local updates available that has not been deployed. Look
  * at commit vs latest_commit on installed apps for this.
  *
+ * This also checks if any of #FlatpakInstalledRef has missing #FlatpakRelatedRef
+ * (which has "should-download" set to TRUE). If so, it adds the "app/" ref,
+ * to the returning #GPtrArray to pull in the #FlatpakRelatedRef again via
+ * #FlatpakTransaction.
+ *
  * Returns: (transfer container) (element-type FlatpakInstalledRef): a GPtrArray of
  *   #FlatpakInstalledRef instances, or %NULL on error
  */
@@ -1014,7 +1019,7 @@ flatpak_installation_list_installed_refs_for_update (FlatpakInstallation *self,
   g_autoptr(GPtrArray) installed = NULL; /* (element-type FlatpakInstalledRef) */
   g_autoptr(GPtrArray) remotes = NULL; /* (element-type FlatpakRemote) */
   g_autoptr(GHashTable) remote_commits = NULL; /* (element-type utf8 utf8) */
-  int i, j;
+  int i, j, k;
   g_autoptr(FlatpakDir) dir = NULL;
   g_auto(OstreeRepoFinderResultv) results = NULL;
   g_autoptr(GAsyncResult) result = NULL;
@@ -1126,7 +1131,7 @@ flatpak_installation_list_installed_refs_for_update (FlatpakInstallation *self,
           if (remote_related_refs == NULL)
             continue;
 
-          for (guint j = 0; j < remote_related_refs->len; j++)
+          for (j = 0; j < remote_related_refs->len; j++)
             {
               FlatpakRelatedRef *remote_related_ref = g_ptr_array_index (remote_related_refs, j);
               gboolean should_download = flatpak_related_ref_should_download (remote_related_ref);
@@ -1134,14 +1139,17 @@ flatpak_installation_list_installed_refs_for_update (FlatpakInstallation *self,
 
               if (should_download && installed_related_refs != NULL)
                 {
-                  for (guint k = 0; k < installed_related_refs->len; k++)
+                  for (k = 0; k < installed_related_refs->len; k++)
                     {
                       FlatpakRelatedRef *installed_related_ref = g_ptr_array_index (installed_related_refs, k);
                       g_autofree gchar *full_ref1 = flatpak_ref_format_ref (FLATPAK_REF (installed_related_ref));
                       g_autofree gchar *full_ref2 = flatpak_ref_format_ref (FLATPAK_REF (remote_related_ref));
 
                       if (g_strcmp0 (full_ref1, full_ref2) == 0)
-                        related_ref_found = TRUE;
+                        {
+                          related_ref_found = TRUE;
+                          break;
+                        }
                     }
 
                   if (should_download && !related_ref_found)
